@@ -97,56 +97,28 @@ jobs:
           make install
           echo "Host Python: $(/tmp/cpython-host/bin/python3 --version)"
 
-      # ── 6. Configure for wasm32-wasi ─────────────────────────────────────────
-      - name: Configure CPython for wasm32-wasi
+      # ── 6 + 7. Configure and build CPython for wasm32-wasi ───────────────────
+      - name: Build CPython WASM via wasi.py
         working-directory: /tmp/cpython
         run: |
-          make distclean || true
+          # wasi.py is the official CPython 3.13 WASM build tool
+          # It manages configure + make internally, no --prefix needed
+          export WASI_SDK_PATH=/opt/wasi-sdk
 
-          if [ -f "Tools/wasm/wasi.py" ]; then
-            echo "Using Tools/wasm/wasi.py (CPython 3.13 native WASM build)"
-            WASI_SDK_PATH=/opt/wasi-sdk \
-              python3 Tools/wasm/wasi.py configure-build-python
-            WASI_SDK_PATH=/opt/wasi-sdk \
-              python3 Tools/wasm/wasi.py make-build-python
-            WASI_SDK_PATH=/opt/wasi-sdk \
-              python3 Tools/wasm/wasi.py configure-host --prefix=/tmp/cpython-wasm
-            echo "WASI_BUILD_TOOL=yes" >> $GITHUB_ENV
-          else
-            echo "Falling back to manual configure"
-            echo "WASI_BUILD_TOOL=no" >> $GITHUB_ENV
-            CONFIG_SITE=/tmp/cpython/Tools/wasm/config.site-wasm32-wasi \
-            WASI_SDK_PATH=/opt/wasi-sdk \
-            CC=/opt/wasi-sdk/bin/clang \
-            AR=/opt/wasi-sdk/bin/llvm-ar \
-            RANLIB=/opt/wasi-sdk/bin/llvm-ranlib \
-            ./configure \
-              --host=wasm32-wasi \
-              --build=$(./config.guess) \
-              --with-build-python=/tmp/cpython-host/bin/python3 \
-              --prefix=/tmp/cpython-wasm \
-              --disable-ipv6 \
-              --disable-shared \
-              --with-ensurepip=no \
-              --without-pymalloc \
-              CFLAGS="-O2 -D_WASI_EMULATED_SIGNAL -D_WASI_EMULATED_MMAN" \
-              LDFLAGS="-lwasi-emulated-signal -lwasi-emulated-mman"
-          fi
+          echo "=== Step 1: configure-build-python ==="
+          python3 Tools/wasm/wasi.py configure-build-python
 
-      # ── 7. Build CPython WASM ────────────────────────────────────────────────
-      - name: Build CPython WASM
-        working-directory: /tmp/cpython
-        run: |
-          if [ "$WASI_BUILD_TOOL" = "yes" ]; then
-            WASI_SDK_PATH=/opt/wasi-sdk \
-              python3 Tools/wasm/wasi.py make-host 2>&1 | tail -100
-          else
-            make -j$(nproc) WASI_SDK_PATH=/opt/wasi-sdk 2>&1 | tail -100
-          fi
+          echo "=== Step 2: make-build-python ==="
+          python3 Tools/wasm/wasi.py make-build-python
+
+          echo "=== Step 3: configure-host ==="
+          python3 Tools/wasm/wasi.py configure-host
+
+          echo "=== Step 4: make-host ==="
+          python3 Tools/wasm/wasi.py make-host 2>&1 | tail -50
 
           echo "=== Searching for .wasm files ==="
-          find /tmp/cpython -name "*.wasm" -ls 2>/dev/null || echo "No .wasm found in /tmp/cpython"
-          find /tmp/cpython-wasm -name "*.wasm" -ls 2>/dev/null || true
+          find /tmp/cpython -name "*.wasm" -ls 2>/dev/null || echo "No .wasm found"
 
       # ── 8. Package artifacts ─────────────────────────────────────────────────
       - name: Package artifacts
