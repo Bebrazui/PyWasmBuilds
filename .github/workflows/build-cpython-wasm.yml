@@ -65,22 +65,30 @@ jobs:
         with:
           python-version: '3.13'
 
-      # ── 4. CPython source (cached) ───────────────────────────────────────────
+      # ── 4. CPython source (cached — source only, no build artifacts) ───────────
       - name: Cache CPython source
         id: cache-cpython-src
         uses: actions/cache@v4
         with:
-          path: /tmp/cpython
-          key: cpython-src-${{ env.CPYTHON_VERSION }}
+          path: /tmp/cpython-src.tar
+          key: cpython-src-tar-${{ env.CPYTHON_VERSION }}
 
       - name: Clone CPython
         if: steps.cache-cpython-src.outputs.cache-hit != 'true'
         run: |
           git clone --depth 1 --branch ${{ env.CPYTHON_VERSION }} \
-            https://github.com/python/cpython.git /tmp/cpython
-          echo "Cloned: $(cat /tmp/cpython/Misc/python-version)"
+            https://github.com/python/cpython.git /tmp/cpython-clean
+          # Save clean source as tar for caching (no build artifacts)
+          tar -cf /tmp/cpython-src.tar -C /tmp cpython-clean
+          echo "Cloned and archived: $(cat /tmp/cpython-clean/Misc/python-version)"
 
-      # ── 5. Host Python build (cached) ────────────────────────────────────────
+      - name: Extract CPython source
+        run: |
+          tar -xf /tmp/cpython-src.tar -C /tmp
+          mv /tmp/cpython-clean /tmp/cpython
+          echo "Source ready: $(cat /tmp/cpython/Misc/python-version)"
+
+      # ── 5. Host Python build (cached separately) ─────────────────────────────
       - name: Cache host Python build
         id: cache-host-python
         uses: actions/cache@v4
@@ -97,27 +105,33 @@ jobs:
           make install
           echo "Host Python: $(/tmp/cpython-host/bin/python3 --version)"
 
-      # ── 6 + 7. Configure and build CPython for wasm32-wasi ───────────────────
+      # ── 6. Clean source tree before WASM build ───────────────────────────────
+      - name: Clean source tree for WASM build
+        working-directory: /tmp/cpython
+        run: |
+          # wasi.py requires a clean source tree (no .o files from host build)
+          git clean -fdx -e Doc/venv
+          echo "Source tree cleaned"
+
+      # ── 7. Build CPython WASM via wasi.py ────────────────────────────────────
       - name: Build CPython WASM via wasi.py
         working-directory: /tmp/cpython
         run: |
-          # wasi.py is the official CPython 3.13 WASM build tool
-          # It manages configure + make internally, no --prefix needed
           export WASI_SDK_PATH=/opt/wasi-sdk
 
-          echo "=== Step 1: configure-build-python ==="
+          echo "=== configure-build-python ==="
           python3 Tools/wasm/wasi.py configure-build-python
 
-          echo "=== Step 2: make-build-python ==="
+          echo "=== make-build-python ==="
           python3 Tools/wasm/wasi.py make-build-python
 
-          echo "=== Step 3: configure-host ==="
+          echo "=== configure-host ==="
           python3 Tools/wasm/wasi.py configure-host
 
-          echo "=== Step 4: make-host ==="
+          echo "=== make-host ==="
           python3 Tools/wasm/wasi.py make-host 2>&1 | tail -50
 
-          echo "=== Searching for .wasm files ==="
+          echo "=== .wasm files ==="
           find /tmp/cpython -name "*.wasm" -ls 2>/dev/null || echo "No .wasm found"
 
       # ── 8. Package artifacts ─────────────────────────────────────────────────
