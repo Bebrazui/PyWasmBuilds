@@ -7,6 +7,10 @@ on:
     paths:
       - '.github/workflows/build-cpython-wasm.yml'
 
+env:
+  WASI_SDK_VERSION: "24"
+  CPYTHON_VERSION: "v3.13.0"
+
 jobs:
   build:
     runs-on: ubuntu-22.04
@@ -16,7 +20,13 @@ jobs:
       - name: Checkout
         uses: actions/checkout@v4
 
-      # ── 1. Install system dependencies ──────────────────────────────────────
+      # ── 1. System dependencies (apt cache) ──────────────────────────────────
+      - name: Cache apt packages
+        uses: actions/cache@v4
+        with:
+          path: /var/cache/apt/archives
+          key: apt-${{ runner.os }}-build-deps-v1
+
       - name: Install build dependencies
         run: |
           sudo apt-get update -qq
@@ -24,36 +34,62 @@ jobs:
             build-essential pkg-config \
             libssl-dev zlib1g-dev libbz2-dev \
             libreadline-dev libsqlite3-dev libffi-dev \
-            curl wget git xz-utils
+            curl wget git xz-utils zip
 
-      # ── 2. Download wasi-sdk ─────────────────────────────────────────────────
-      - name: Download wasi-sdk 24
+      # ── 2. wasi-sdk (cached) ─────────────────────────────────────────────────
+      - name: Cache wasi-sdk
+        id: cache-wasi
+        uses: actions/cache@v4
+        with:
+          path: /opt/wasi-sdk
+          key: wasi-sdk-${{ env.WASI_SDK_VERSION }}-linux-x86_64
+
+      - name: Download wasi-sdk
+        if: steps.cache-wasi.outputs.cache-hit != 'true'
         run: |
-          WASI_SDK_VERSION=24
-          WASI_SDK_URL="https://github.com/WebAssembly/wasi-sdk/releases/download/wasi-sdk-${WASI_SDK_VERSION}/wasi-sdk-${WASI_SDK_VERSION}.0-x86_64-linux.tar.gz"
+          URL="https://github.com/WebAssembly/wasi-sdk/releases/download/wasi-sdk-${WASI_SDK_VERSION}/wasi-sdk-${WASI_SDK_VERSION}.0-x86_64-linux.tar.gz"
           echo "Downloading wasi-sdk ${WASI_SDK_VERSION}..."
-          wget -q "$WASI_SDK_URL" -O /tmp/wasi-sdk.tar.gz
+          wget -q "$URL" -O /tmp/wasi-sdk.tar.gz
           sudo tar -xzf /tmp/wasi-sdk.tar.gz -C /opt
           sudo mv /opt/wasi-sdk-${WASI_SDK_VERSION}.0-x86_64-linux /opt/wasi-sdk
+
+      - name: Setup wasi-sdk env
+        run: |
           echo "WASI_SDK_PATH=/opt/wasi-sdk" >> $GITHUB_ENV
           echo "/opt/wasi-sdk/bin" >> $GITHUB_PATH
-          echo "wasi-sdk installed: $(/opt/wasi-sdk/bin/clang --version | head -1)"
+          echo "wasi-sdk: $(/opt/wasi-sdk/bin/clang --version | head -1)"
 
-      # ── 3. Install a host Python (needed for CPython build system) ───────────
+      # ── 3. Host Python ───────────────────────────────────────────────────────
       - name: Set up host Python 3.13
         uses: actions/setup-python@v5
         with:
           python-version: '3.13'
 
-      # ── 4. Clone CPython 3.13 ────────────────────────────────────────────────
-      - name: Clone CPython 3.13
-        run: |
-          git clone --depth 1 --branch v3.13.0 \
-            https://github.com/python/cpython.git /tmp/cpython
-          echo "CPython cloned: $(cat /tmp/cpython/Misc/python-version)"
+      # ── 4. CPython source (cached) ───────────────────────────────────────────
+      - name: Cache CPython source
+        id: cache-cpython-src
+        uses: actions/cache@v4
+        with:
+          path: /tmp/cpython
+          key: cpython-src-${{ env.CPYTHON_VERSION }}
 
-      # ── 5. Build host Python (needed as build tool) ──────────────────────────
+      - name: Clone CPython
+        if: steps.cache-cpython-src.outputs.cache-hit != 'true'
+        run: |
+          git clone --depth 1 --branch ${{ env.CPYTHON_VERSION }} \
+            https://github.com/python/cpython.git /tmp/cpython
+          echo "Cloned: $(cat /tmp/cpython/Misc/python-version)"
+
+      # ── 5. Host Python build (cached) ────────────────────────────────────────
+      - name: Cache host Python build
+        id: cache-host-python
+        uses: actions/cache@v4
+        with:
+          path: /tmp/cpython-host
+          key: cpython-host-${{ env.CPYTHON_VERSION }}-ubuntu22
+
       - name: Build host Python
+        if: steps.cache-host-python.outputs.cache-hit != 'true'
         working-directory: /tmp/cpython
         run: |
           ./configure --prefix=/tmp/cpython-host
@@ -61,20 +97,23 @@ jobs:
           make install
           echo "Host Python: $(/tmp/cpython-host/bin/python3 --version)"
 
-      # ── 6. Configure CPython for wasm32-wasi ─────────────────────────────────
+      # ── 6. Configure for wasm32-wasi ─────────────────────────────────────────
       - name: Configure CPython for wasm32-wasi
         working-directory: /tmp/cpython
         run: |
           make distclean || true
 
-          # CPython 3.13 has a dedicated WASM build tool
-          echo "=== Trying Tools/wasm/wasi.py build ==="
           if [ -f "Tools/wasm/wasi.py" ]; then
-            python3 Tools/wasm/wasi.py configure-build-python
-            python3 Tools/wasm/wasi.py make-build-python
-            python3 Tools/wasm/wasi.py configure-host --prefix=/tmp/cpython-wasm
+            echo "Using Tools/wasm/wasi.py (CPython 3.13 native WASM build)"
+            WASI_SDK_PATH=/opt/wasi-sdk \
+              python3 Tools/wasm/wasi.py configure-build-python
+            WASI_SDK_PATH=/opt/wasi-sdk \
+              python3 Tools/wasm/wasi.py make-build-python
+            WASI_SDK_PATH=/opt/wasi-sdk \
+              python3 Tools/wasm/wasi.py configure-host --prefix=/tmp/cpython-wasm
             echo "WASI_BUILD_TOOL=yes" >> $GITHUB_ENV
           else
+            echo "Falling back to manual configure"
             echo "WASI_BUILD_TOOL=no" >> $GITHUB_ENV
             CONFIG_SITE=/tmp/cpython/Tools/wasm/config.site-wasm32-wasi \
             WASI_SDK_PATH=/opt/wasi-sdk \
@@ -99,63 +138,57 @@ jobs:
         working-directory: /tmp/cpython
         run: |
           if [ "$WASI_BUILD_TOOL" = "yes" ]; then
-            python3 Tools/wasm/wasi.py make-host 2>&1 | tail -100
+            WASI_SDK_PATH=/opt/wasi-sdk \
+              python3 Tools/wasm/wasi.py make-host 2>&1 | tail -100
           else
             make -j$(nproc) WASI_SDK_PATH=/opt/wasi-sdk 2>&1 | tail -100
           fi
-          echo "=== Build complete. Searching for WASM files ==="
-          find /tmp/cpython -name "*.wasm" -ls 2>/dev/null || echo "No .wasm found"
-          find /tmp/cpython -name "python*" -ls 2>/dev/null | head -30
-          ls -lh /tmp/cpython/ | head -30
 
-      # ── 8. Package stdlib ────────────────────────────────────────────────────
-      - name: Package stdlib
+          echo "=== Searching for .wasm files ==="
+          find /tmp/cpython -name "*.wasm" -ls 2>/dev/null || echo "No .wasm found in /tmp/cpython"
+          find /tmp/cpython-wasm -name "*.wasm" -ls 2>/dev/null || true
+
+      # ── 8. Package artifacts ─────────────────────────────────────────────────
+      - name: Package artifacts
         run: |
           mkdir -p /tmp/wasm-dist
 
-          # Search for python.wasm in multiple possible locations
-          echo "=== Searching for python.wasm ==="
-          find /tmp/cpython -name "*.wasm" 2>/dev/null
-
-          # CPython WASM build can produce the binary in different places
-          # depending on version and build flags
+          # Find python.wasm — check all known output locations
           for candidate in \
             /tmp/cpython/python.wasm \
             /tmp/cpython/Programs/python.wasm \
-            /tmp/cpython/build/wasm32-wasi/python.wasm \
             /tmp/cpython/cross-build/wasm32-wasi/python.wasm \
-            /tmp/cpython/cross-build/wasm32-wasi/Programs/python.wasm; do
+            /tmp/cpython/cross-build/wasm32-wasi/Programs/python.wasm \
+            /tmp/cpython-wasm/bin/python3.wasm \
+            /tmp/cpython-wasm/python.wasm; do
             if [ -f "$candidate" ]; then
-              echo "Found: $candidate"
+              echo "Found python.wasm at: $candidate ($(du -sh $candidate | cut -f1))"
               cp "$candidate" /tmp/wasm-dist/python.wasm
               break
             fi
           done
 
-          # If still not found, try find
+          # Fallback: find any .wasm
           if [ ! -f /tmp/wasm-dist/python.wasm ]; then
-            FOUND=$(find /tmp/cpython -name "python.wasm" 2>/dev/null | head -1)
+            FOUND=$(find /tmp/cpython /tmp/cpython-wasm -name "*.wasm" 2>/dev/null | head -1)
             if [ -n "$FOUND" ]; then
-              echo "Found via find: $FOUND"
+              echo "Fallback: copying $FOUND"
               cp "$FOUND" /tmp/wasm-dist/python.wasm
             else
-              echo "WARNING: python.wasm not found, copying any .wasm file"
-              find /tmp/cpython -name "*.wasm" -exec cp {} /tmp/wasm-dist/ \; 2>/dev/null || true
+              echo "ERROR: No .wasm file found anywhere!"
+              exit 1
             fi
           fi
 
-          # Package stdlib (zip for browser loading)
-          STDLIB_DIR="/tmp/cpython/Lib"
-          if [ -d "$STDLIB_DIR" ]; then
-            cd /tmp/cpython
-            zip -r /tmp/wasm-dist/python313-stdlib.zip Lib/ \
-              --exclude "Lib/test/*" \
-              --exclude "Lib/__pycache__/*" \
-              --exclude "Lib/*/test/*"
-            echo "Stdlib packaged: $(du -sh /tmp/wasm-dist/python313-stdlib.zip)"
-          fi
+          # Package stdlib
+          cd /tmp/cpython
+          zip -r /tmp/wasm-dist/python313-stdlib.zip Lib/ \
+            --exclude "Lib/test/*" \
+            --exclude "Lib/__pycache__/*" \
+            --exclude "Lib/*/test/*" \
+            --exclude "Lib/*/tests/*"
 
-          echo "=== Final dist contents ==="
+          echo "=== Dist contents ==="
           ls -lh /tmp/wasm-dist/
 
       # ── 9. Upload artifacts ──────────────────────────────────────────────────
@@ -166,7 +199,7 @@ jobs:
           path: /tmp/wasm-dist/
           retention-days: 30
 
-      # ── 10. Print summary ────────────────────────────────────────────────────
+      # ── 10. Summary ──────────────────────────────────────────────────────────
       - name: Build summary
         run: |
           echo "## CPython WASM Build Summary" >> $GITHUB_STEP_SUMMARY
