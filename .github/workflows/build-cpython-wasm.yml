@@ -1,0 +1,135 @@
+name: Build CPython WASM (wasm32-wasi)
+
+on:
+  workflow_dispatch:
+  push:
+    branches: [main]
+    paths:
+      - '.github/workflows/build-cpython-wasm.yml'
+
+jobs:
+  build:
+    runs-on: ubuntu-22.04
+    timeout-minutes: 60
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      # ── 1. Install system dependencies ──────────────────────────────────────
+      - name: Install build dependencies
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y --no-install-recommends \
+            build-essential pkg-config \
+            libssl-dev zlib1g-dev libbz2-dev \
+            libreadline-dev libsqlite3-dev libffi-dev \
+            curl wget git xz-utils
+
+      # ── 2. Download wasi-sdk ─────────────────────────────────────────────────
+      - name: Download wasi-sdk 24
+        run: |
+          WASI_SDK_VERSION=24
+          WASI_SDK_URL="https://github.com/WebAssembly/wasi-sdk/releases/download/wasi-sdk-${WASI_SDK_VERSION}/wasi-sdk-${WASI_SDK_VERSION}.0-x86_64-linux.tar.gz"
+          echo "Downloading wasi-sdk ${WASI_SDK_VERSION}..."
+          wget -q "$WASI_SDK_URL" -O /tmp/wasi-sdk.tar.gz
+          sudo tar -xzf /tmp/wasi-sdk.tar.gz -C /opt
+          sudo mv /opt/wasi-sdk-${WASI_SDK_VERSION}.0-x86_64-linux /opt/wasi-sdk
+          echo "WASI_SDK_PATH=/opt/wasi-sdk" >> $GITHUB_ENV
+          echo "/opt/wasi-sdk/bin" >> $GITHUB_PATH
+          echo "wasi-sdk installed: $(/opt/wasi-sdk/bin/clang --version | head -1)"
+
+      # ── 3. Install a host Python (needed for CPython build system) ───────────
+      - name: Set up host Python 3.13
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.13'
+
+      # ── 4. Clone CPython 3.13 ────────────────────────────────────────────────
+      - name: Clone CPython 3.13
+        run: |
+          git clone --depth 1 --branch v3.13.0 \
+            https://github.com/python/cpython.git /tmp/cpython
+          echo "CPython cloned: $(cat /tmp/cpython/Misc/python-version)"
+
+      # ── 5. Build host Python (needed as build tool) ──────────────────────────
+      - name: Build host Python
+        working-directory: /tmp/cpython
+        run: |
+          ./configure --prefix=/tmp/cpython-host
+          make -j$(nproc) python
+          make install
+          echo "Host Python: $(/tmp/cpython-host/bin/python3 --version)"
+
+      # ── 6. Configure CPython for wasm32-wasi ─────────────────────────────────
+      - name: Configure CPython for wasm32-wasi
+        working-directory: /tmp/cpython
+        run: |
+          make distclean || true
+
+          CONFIG_SITE=/tmp/cpython/Tools/wasm/config.site-wasm32-wasi \
+          WASI_SDK_PATH=/opt/wasi-sdk \
+          CC=/opt/wasi-sdk/bin/clang \
+          AR=/opt/wasi-sdk/bin/llvm-ar \
+          RANLIB=/opt/wasi-sdk/bin/llvm-ranlib \
+          ./configure \
+            --host=wasm32-wasi \
+            --build=$(./config.guess) \
+            --with-build-python=/tmp/cpython-host/bin/python3 \
+            --prefix=/tmp/cpython-wasm \
+            --disable-ipv6 \
+            --disable-shared \
+            --with-ensurepip=no \
+            --without-pymalloc \
+            CFLAGS="-O2 -D_WASI_EMULATED_SIGNAL -D_WASI_EMULATED_MMAN" \
+            LDFLAGS="-lwasi-emulated-signal -lwasi-emulated-mman"
+
+      # ── 7. Build CPython WASM ────────────────────────────────────────────────
+      - name: Build CPython WASM
+        working-directory: /tmp/cpython
+        run: |
+          make -j$(nproc) WASI_SDK_PATH=/opt/wasi-sdk 2>&1 | tail -50
+          echo "Build complete. Checking output..."
+          ls -lh python.wasm 2>/dev/null || ls -lh *.wasm 2>/dev/null || echo "Searching for .wasm files..."
+          find /tmp/cpython -name "*.wasm" -ls 2>/dev/null
+
+      # ── 8. Package stdlib ────────────────────────────────────────────────────
+      - name: Package stdlib
+        run: |
+          mkdir -p /tmp/wasm-dist
+          # Copy the WASM binary
+          find /tmp/cpython -name "python.wasm" -exec cp {} /tmp/wasm-dist/ \;
+          find /tmp/cpython -name "*.wasm" -exec cp {} /tmp/wasm-dist/ \; 2>/dev/null || true
+
+          # Package stdlib (zip for browser loading)
+          STDLIB_DIR="/tmp/cpython/Lib"
+          if [ -d "$STDLIB_DIR" ]; then
+            cd /tmp/cpython
+            zip -r /tmp/wasm-dist/python313-stdlib.zip Lib/ \
+              --exclude "Lib/test/*" \
+              --exclude "Lib/__pycache__/*" \
+              --exclude "Lib/*/test/*"
+            echo "Stdlib packaged: $(du -sh /tmp/wasm-dist/python313-stdlib.zip)"
+          fi
+
+          ls -lh /tmp/wasm-dist/
+          echo "WASM binary size: $(du -sh /tmp/wasm-dist/*.wasm 2>/dev/null || echo 'not found')"
+
+      # ── 9. Upload artifacts ──────────────────────────────────────────────────
+      - name: Upload WASM artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: cpython-wasm-wasi
+          path: /tmp/wasm-dist/
+          retention-days: 30
+
+      # ── 10. Print summary ────────────────────────────────────────────────────
+      - name: Build summary
+        run: |
+          echo "## CPython WASM Build Summary" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "| File | Size |" >> $GITHUB_STEP_SUMMARY
+          echo "|------|------|" >> $GITHUB_STEP_SUMMARY
+          for f in /tmp/wasm-dist/*; do
+            echo "| $(basename $f) | $(du -sh $f | cut -f1) |" >> $GITHUB_STEP_SUMMARY
+          done
