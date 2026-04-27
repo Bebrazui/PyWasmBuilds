@@ -105,7 +105,23 @@ jobs:
           make install
           echo "Host Python: $(/tmp/cpython-host/bin/python3 --version)"
 
-      # ── 6. Clean source tree before WASM build ───────────────────────────────
+      # ── 6. Install wasmtime + clean source tree ──────────────────────────────
+      - name: Cache wasmtime
+        id: cache-wasmtime
+        uses: actions/cache@v4
+        with:
+          path: ~/.wasmtime
+          key: wasmtime-v25-linux-x86_64
+
+      - name: Install wasmtime
+        if: steps.cache-wasmtime.outputs.cache-hit != 'true'
+        run: |
+          curl -fsSL https://wasmtime.dev/install.sh | bash
+          echo "wasmtime: $(~/.wasmtime/bin/wasmtime --version)"
+
+      - name: Add wasmtime to PATH
+        run: echo "$HOME/.wasmtime/bin" >> $GITHUB_PATH
+
       - name: Clean source tree for WASM build
         working-directory: /tmp/cpython
         run: |
