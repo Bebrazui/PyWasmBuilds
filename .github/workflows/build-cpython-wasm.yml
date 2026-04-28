@@ -143,20 +143,20 @@ jobs:
           python3 Tools/wasm/wasi.py make-build-python
 
           echo "=== configure-host (with dynamic export flags) ==="
-          # Patch wasi.py to add --export-dynamic so C-extensions can link against Python C API
-          python3 << 'PYEOF'
+          # Write patch script to file to avoid YAML quoting issues
+          cat > /tmp/patch_wasi.py << 'EOF'
 with open('Tools/wasm/wasi.py', 'r') as f:
     src = f.read()
-src = src.replace(
+patched = src.replace(
     'env_additions | wasi_sdk_env(context)',
     'env_additions | wasi_sdk_env(context) | {"LDFLAGS": "-Wl,--export-dynamic"}'
 )
 with open('Tools/wasm/wasi.py', 'w') as f:
-    f.write(src)
-print('Patched wasi.py with --export-dynamic')
-PYEOF
-          WASI_SDK_PATH=/opt/wasi-sdk \
-          python3 Tools/wasm/wasi.py configure-host
+    f.write(patched)
+print('Patched wasi.py: --export-dynamic added')
+EOF
+          python3 /tmp/patch_wasi.py
+          WASI_SDK_PATH=/opt/wasi-sdk python3 Tools/wasm/wasi.py configure-host
 
           echo "=== make-host ==="
           python3 Tools/wasm/wasi.py make-host 2>&1 | tail -50
