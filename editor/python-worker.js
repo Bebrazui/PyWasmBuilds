@@ -423,6 +423,43 @@ async function loadStdlib() {
 const SITE_PACKAGES = '/usr/local/lib/python3.13/site-packages';
 const installedPackages = new Set();
 
+// ── Dynamic C-extension loader ────────────────────────────────────────────────
+
+// Registry of loaded WASM C-extension instances
+const cExtensions = new Map(); // moduleName -> WebAssembly.Instance
+
+/**
+ * Load a C-extension .wasm file and link it with CPython exports.
+ * The extension must export PyInit_{moduleName}.
+ */
+async function loadCExtension(moduleName, wasmBytes, cpythonExports) {
+  // Build import object from CPython exports
+  const env = {};
+  for (const [name, value] of Object.entries(cpythonExports)) {
+    if (typeof value === 'function' || value instanceof WebAssembly.Global) {
+      env[name] = value;
+    }
+  }
+
+  const imports = {
+    env,
+    wasi_snapshot_preview1: new Proxy({}, {
+      get: () => () => 0  // stub WASI calls in extensions
+    })
+  };
+
+  try {
+    const result = await WebAssembly.instantiate(wasmBytes, imports);
+    const instance = result.instance;
+    cExtensions.set(moduleName, instance);
+    self.postMessage({ type: 'stdout', data: `Loaded C-extension: ${moduleName}\n` });
+    return instance;
+  } catch (e) {
+    self.postMessage({ type: 'stderr', data: `Failed to load C-extension ${moduleName}: ${e.message}\n` });
+    return null;
+  }
+}
+
 async function pipInstall(packageName) {
   const pkg = packageName.toLowerCase().trim();
   if (installedPackages.has(pkg)) return null;
@@ -484,8 +521,7 @@ async function pipInstall(packageName) {
   }
 
   self.postMessage({ type: 'pip.status', data: `Installed ${name} ${version} (${count} files)` });
-  return { name, version };
-}
+  return { name, version };}
 
 // ── Main ──────────────────────────────────────────────────────────────────────
 
@@ -563,6 +599,19 @@ self.onmessage = async (e) => {
     try {
       const result = await pipInstall(e.data.package);
       self.postMessage({ type: 'pip.result', id, value: result });
+    } catch(err) {
+      self.postMessage({ type: 'error', id, error: { type: err.name, message: err.message, traceback: '' } });
+    }
+  }
+  else if (type === 'load.extension') {
+    // Load a WASM C-extension and link with CPython
+    try {
+      if (!wasmModule) throw new Error('Runtime not initialized');
+      // We need the CPython instance exports — run a dummy to get them
+      // Actually we store them from the last run
+      const inst = await WebAssembly.instantiate(wasmModule, { wasi_snapshot_preview1: new Proxy({}, { get: () => () => 0 }) });
+      await loadCExtension(e.data.moduleName, e.data.wasmBytes, inst.exports);
+      self.postMessage({ type: 'result', id, value: 'null' });
     } catch(err) {
       self.postMessage({ type: 'error', id, error: { type: err.name, message: err.message, traceback: '' } });
     }

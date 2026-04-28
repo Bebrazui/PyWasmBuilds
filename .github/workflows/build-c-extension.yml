@@ -1,0 +1,128 @@
+name: Build C-Extension WASM
+
+on:
+  workflow_dispatch:
+  push:
+    branches: [main]
+    paths:
+      - '.github/workflows/build-c-extension.yml'
+      - 'c-extensions/**'
+
+env:
+  WASI_SDK_VERSION: "24"
+  CPYTHON_VERSION: "v3.13.0"
+
+jobs:
+  build:
+    runs-on: ubuntu-22.04
+    timeout-minutes: 30
+    permissions:
+      contents: write
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Cache wasi-sdk
+        id: cache-wasi
+        uses: actions/cache@v4
+        with:
+          path: /opt/wasi-sdk
+          key: wasi-sdk-${{ env.WASI_SDK_VERSION }}-linux-x86_64
+
+      - name: Download wasi-sdk
+        if: steps.cache-wasi.outputs.cache-hit != 'true'
+        run: |
+          URL="https://github.com/WebAssembly/wasi-sdk/releases/download/wasi-sdk-${WASI_SDK_VERSION}/wasi-sdk-${WASI_SDK_VERSION}.0-x86_64-linux.tar.gz"
+          wget -q "$URL" -O /tmp/wasi-sdk.tar.gz
+          sudo tar -xzf /tmp/wasi-sdk.tar.gz -C /opt
+          sudo mv /opt/wasi-sdk-${WASI_SDK_VERSION}.0-x86_64-linux /opt/wasi-sdk
+
+      - name: Cache CPython source
+        id: cache-cpython-src
+        uses: actions/cache@v4
+        with:
+          path: /tmp/cpython-src.tar
+          key: cpython-src-tar-${{ env.CPYTHON_VERSION }}
+
+      - name: Clone CPython
+        if: steps.cache-cpython-src.outputs.cache-hit != 'true'
+        run: |
+          git clone --depth 1 --branch ${{ env.CPYTHON_VERSION }} \
+            https://github.com/python/cpython.git /tmp/cpython-clean
+          tar -cf /tmp/cpython-src.tar -C /tmp cpython-clean
+
+      - name: Extract CPython source
+        run: |
+          tar -xf /tmp/cpython-src.tar -C /tmp
+          mv /tmp/cpython-clean /tmp/cpython
+
+      - name: Build test C-extension
+        run: |
+          # Create a simple test C-extension
+          mkdir -p /tmp/ext-build
+          cat > /tmp/ext-build/testmodule.c << 'CEOF'
+          #define PY_SSIZE_T_CLEAN
+          #include "Python.h"
+
+          static PyObject* test_hello(PyObject* self, PyObject* args) {
+              return PyUnicode_FromString("Hello from C-extension WASM!");
+          }
+
+          static PyObject* test_add(PyObject* self, PyObject* args) {
+              long a, b;
+              if (!PyArg_ParseTuple(args, "ll", &a, &b)) return NULL;
+              return PyLong_FromLong(a + b);
+          }
+
+          static PyMethodDef TestMethods[] = {
+              {"hello", test_hello, METH_NOARGS, "Return hello string"},
+              {"add",   test_add,   METH_VARARGS, "Add two numbers"},
+              {NULL, NULL, 0, NULL}
+          };
+
+          static struct PyModuleDef testmodule = {
+              PyModuleDef_HEAD_INIT, "_testcext", NULL, -1, TestMethods
+          };
+
+          PyMODINIT_FUNC PyInit__testcext(void) {
+              return PyModule_Create(&testmodule);
+          }
+          CEOF
+
+          # Compile to WASM using wasi-sdk
+          # Include CPython headers
+          PYTHON_INCLUDE=/tmp/cpython/Include
+          PYTHON_INCLUDE2=/tmp/cpython/Include/cpython
+
+          /opt/wasi-sdk/bin/clang \
+            --target=wasm32-wasi \
+            --sysroot=/opt/wasi-sdk/share/wasi-sysroot \
+            -I${PYTHON_INCLUDE} \
+            -I${PYTHON_INCLUDE2} \
+            -I/tmp/cpython \
+            -DPy_BUILD_CORE_BUILTIN=1 \
+            -O2 \
+            -shared \
+            -Wl,--no-entry \
+            -Wl,--export=PyInit__testcext \
+            -o /tmp/ext-build/_testcext.wasm \
+            /tmp/ext-build/testmodule.c
+
+          echo "Built _testcext.wasm: $(du -sh /tmp/ext-build/_testcext.wasm)"
+          ls -lh /tmp/ext-build/
+
+      - name: Upload extension artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: c-extensions-wasm
+          path: /tmp/ext-build/*.wasm
+          retention-days: 30
+
+      - name: Update GitHub Release
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: "cpython-wasm-v3.13.0"
+          files: /tmp/ext-build/_testcext.wasm
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
