@@ -85,8 +85,8 @@ jobs:
 
           export WASI_SDK_PATH=/opt/wasi-sdk
           python3 Tools/wasm/wasi.py configure-build-python
-          python3 Tools/wasm/wasi.py make-build-python
           git clean -fdx -e Doc/venv -e cross-build
+          python3 Tools/wasm/wasi.py make-build-python
           python3 Tools/wasm/wasi.py configure-host
 
           PYCONFIG=$(find /tmp/cpython/cross-build -name "pyconfig.h" | head -1)
