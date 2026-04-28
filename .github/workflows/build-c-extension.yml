@@ -89,7 +89,13 @@ jobs:
           python3 Tools/wasm/wasi.py make-build-python
           python3 Tools/wasm/wasi.py configure-host
 
-          PYCONFIG=$(find /tmp/cpython/cross-build -name "pyconfig.h" | head -1)
+          # pyconfig.h is in the WASI build dir, not host
+          PYCONFIG=$(find /tmp/cpython/cross-build/wasm32-wasi -name "pyconfig.h" 2>/dev/null | head -1)
+          if [ -z "$PYCONFIG" ]; then
+            echo "ERROR: WASI pyconfig.h not found"
+            find /tmp/cpython/cross-build -name "pyconfig.h" 2>/dev/null
+            exit 1
+          fi
           echo "WASI pyconfig.h: $PYCONFIG"
           echo "PYCONFIG_DIR=$(dirname $PYCONFIG)" >> $GITHUB_ENV
 
