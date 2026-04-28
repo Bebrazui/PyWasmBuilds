@@ -57,56 +57,60 @@ jobs:
           tar -xf /tmp/cpython-src.tar -C /tmp
           mv /tmp/cpython-clean /tmp/cpython
 
-      - name: Build test C-extension
+      - name: Build host Python to get pyconfig.h
+        run: |
+          cd /tmp/cpython
+          ./configure --prefix=/tmp/cpython-host 2>/dev/null
+          make -j$(nproc) python 2>/dev/null
+          PYCONFIG=$(find /tmp/cpython -name "pyconfig.h" | head -1)
+          echo "pyconfig.h: $PYCONFIG"
+          echo "PYCONFIG_DIR=$(dirname $PYCONFIG)" >> $GITHUB_ENV
+
+      - name: Write C extension source
         run: |
           mkdir -p /tmp/ext-build
-
-          # pyconfig.h is generated during CPython build — need to build CPython first
-          # Use the cached host build to get pyconfig.h, then cross-compile
-          # First build CPython for host to get pyconfig.h
-          cd /tmp/cpython
-          ./configure --prefix=/tmp/cpython-host-ext 2>/dev/null || true
-          make -j$(nproc) python 2>/dev/null || true
-
-          # pyconfig.h should now exist
-          PYCONFIG_DIR=$(find /tmp/cpython -name "pyconfig.h" | head -1 | xargs dirname)
-          echo "pyconfig.h found at: $PYCONFIG_DIR"
-
-          cat > /tmp/ext-build/testmodule.c << 'CEOF'
+          python3 -c "
+src = '''
 #define PY_SSIZE_T_CLEAN
-#include "Python.h"
+#include \"Python.h\"
 
 static PyObject* test_hello(PyObject* self, PyObject* args) {
-    return PyUnicode_FromString("Hello from C-extension WASM!");
+    return PyUnicode_FromString(\"Hello from C-extension WASM!\");
 }
 
 static PyObject* test_add(PyObject* self, PyObject* args) {
     long a, b;
-    if (!PyArg_ParseTuple(args, "ll", &a, &b)) return NULL;
+    if (!PyArg_ParseTuple(args, \"ll\", &a, &b)) return NULL;
     return PyLong_FromLong(a + b);
 }
 
 static PyMethodDef TestMethods[] = {
-    {"hello", test_hello, METH_NOARGS, "Return hello string"},
-    {"add",   test_add,   METH_VARARGS, "Add two numbers"},
+    {\"hello\", test_hello, METH_NOARGS, \"Return hello string\"},
+    {\"add\",   test_add,   METH_VARARGS, \"Add two numbers\"},
     {NULL, NULL, 0, NULL}
 };
 
 static struct PyModuleDef testmodule = {
-    PyModuleDef_HEAD_INIT, "_testcext", NULL, -1, TestMethods
+    PyModuleDef_HEAD_INIT, \"_testcext\", NULL, -1, TestMethods
 };
 
 PyMODINIT_FUNC PyInit__testcext(void) {
     return PyModule_Create(&testmodule);
 }
-CEOF
+'''
+with open('/tmp/ext-build/testmodule.c', 'w') as f:
+    f.write(src)
+print('Written testmodule.c')
+"
 
+      - name: Compile C extension to WASM
+        run: |
           /opt/wasi-sdk/bin/clang \
             --target=wasm32-wasi \
             --sysroot=/opt/wasi-sdk/share/wasi-sysroot \
             -I/tmp/cpython/Include \
             -I/tmp/cpython/Include/cpython \
-            -I${PYCONFIG_DIR} \
+            -I${{ env.PYCONFIG_DIR }} \
             -DPy_BUILD_CORE_BUILTIN=1 \
             -O2 \
             -shared \
@@ -114,8 +118,7 @@ CEOF
             -Wl,--export=PyInit__testcext \
             -o /tmp/ext-build/_testcext.wasm \
             /tmp/ext-build/testmodule.c
-
-          echo "Built _testcext.wasm: $(du -sh /tmp/ext-build/_testcext.wasm)"
+          echo "Built: $(du -sh /tmp/ext-build/_testcext.wasm)"
           ls -lh /tmp/ext-build/
 
       - name: Upload extension artifact
