@@ -59,48 +59,54 @@ jobs:
 
       - name: Build test C-extension
         run: |
-          # Create a simple test C-extension
           mkdir -p /tmp/ext-build
+
+          # pyconfig.h is generated during CPython build — need to build CPython first
+          # Use the cached host build to get pyconfig.h, then cross-compile
+          # First build CPython for host to get pyconfig.h
+          cd /tmp/cpython
+          ./configure --prefix=/tmp/cpython-host-ext 2>/dev/null || true
+          make -j$(nproc) python 2>/dev/null || true
+
+          # pyconfig.h should now exist
+          PYCONFIG_DIR=$(find /tmp/cpython -name "pyconfig.h" | head -1 | xargs dirname)
+          echo "pyconfig.h found at: $PYCONFIG_DIR"
+
           cat > /tmp/ext-build/testmodule.c << 'CEOF'
-          #define PY_SSIZE_T_CLEAN
-          #include "Python.h"
+#define PY_SSIZE_T_CLEAN
+#include "Python.h"
 
-          static PyObject* test_hello(PyObject* self, PyObject* args) {
-              return PyUnicode_FromString("Hello from C-extension WASM!");
-          }
+static PyObject* test_hello(PyObject* self, PyObject* args) {
+    return PyUnicode_FromString("Hello from C-extension WASM!");
+}
 
-          static PyObject* test_add(PyObject* self, PyObject* args) {
-              long a, b;
-              if (!PyArg_ParseTuple(args, "ll", &a, &b)) return NULL;
-              return PyLong_FromLong(a + b);
-          }
+static PyObject* test_add(PyObject* self, PyObject* args) {
+    long a, b;
+    if (!PyArg_ParseTuple(args, "ll", &a, &b)) return NULL;
+    return PyLong_FromLong(a + b);
+}
 
-          static PyMethodDef TestMethods[] = {
-              {"hello", test_hello, METH_NOARGS, "Return hello string"},
-              {"add",   test_add,   METH_VARARGS, "Add two numbers"},
-              {NULL, NULL, 0, NULL}
-          };
+static PyMethodDef TestMethods[] = {
+    {"hello", test_hello, METH_NOARGS, "Return hello string"},
+    {"add",   test_add,   METH_VARARGS, "Add two numbers"},
+    {NULL, NULL, 0, NULL}
+};
 
-          static struct PyModuleDef testmodule = {
-              PyModuleDef_HEAD_INIT, "_testcext", NULL, -1, TestMethods
-          };
+static struct PyModuleDef testmodule = {
+    PyModuleDef_HEAD_INIT, "_testcext", NULL, -1, TestMethods
+};
 
-          PyMODINIT_FUNC PyInit__testcext(void) {
-              return PyModule_Create(&testmodule);
-          }
-          CEOF
-
-          # Compile to WASM using wasi-sdk
-          # Include CPython headers
-          PYTHON_INCLUDE=/tmp/cpython/Include
-          PYTHON_INCLUDE2=/tmp/cpython/Include/cpython
+PyMODINIT_FUNC PyInit__testcext(void) {
+    return PyModule_Create(&testmodule);
+}
+CEOF
 
           /opt/wasi-sdk/bin/clang \
             --target=wasm32-wasi \
             --sysroot=/opt/wasi-sdk/share/wasi-sysroot \
-            -I${PYTHON_INCLUDE} \
-            -I${PYTHON_INCLUDE2} \
-            -I/tmp/cpython \
+            -I/tmp/cpython/Include \
+            -I/tmp/cpython/Include/cpython \
+            -I${PYCONFIG_DIR} \
             -DPy_BUILD_CORE_BUILTIN=1 \
             -O2 \
             -shared \
