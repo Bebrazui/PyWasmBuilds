@@ -3,58 +3,92 @@
 <head>
   <meta charset="UTF-8" />
   <meta name="viewport" content="width=device-width, initial-scale=1.0" />
-  <title>Python WASM Editor — Custom Runtime</title>
+  <title>Python WASM — Custom Runtime</title>
   <style>
     *, *::before, *::after { box-sizing: border-box; margin: 0; padding: 0; }
     :root {
       --bg: #0d1117; --surface: #161b22; --border: #30363d;
       --accent: #58a6ff; --accent-dim: #1f6feb;
-      --green: #3fb950; --red: #f85149; --yellow: #d29922;
+      --green: #3fb950; --red: #f85149; --yellow: #d29922; --purple: #bc8cff;
       --text: #e6edf3; --text-dim: #8b949e;
       --font-mono: 'JetBrains Mono', 'Fira Code', monospace;
     }
     body { background: var(--bg); color: var(--text); font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif; height: 100vh; display: flex; flex-direction: column; overflow: hidden; }
 
-    header { display: flex; align-items: center; gap: 12px; padding: 10px 16px; background: var(--surface); border-bottom: 1px solid var(--border); flex-shrink: 0; }
-    .logo { display: flex; align-items: center; gap: 8px; font-weight: 600; font-size: 15px; }
-    .logo-icon { width: 28px; height: 28px; background: linear-gradient(135deg, #3572A5, #58a6ff); border-radius: 6px; display: flex; align-items: center; justify-content: center; font-size: 16px; }
-    .badge { display: flex; align-items: center; gap: 6px; padding: 3px 10px; border-radius: 20px; font-size: 12px; font-weight: 500; background: rgba(255,255,255,0.05); border: 1px solid var(--border); }
-    .dot { width: 7px; height: 7px; border-radius: 50%; background: var(--yellow); }
+    /* Header */
+    header { display: flex; align-items: center; gap: 10px; padding: 8px 14px; background: var(--surface); border-bottom: 1px solid var(--border); flex-shrink: 0; }
+    .logo { display: flex; align-items: center; gap: 8px; font-weight: 600; font-size: 14px; }
+    .logo-icon { width: 26px; height: 26px; background: linear-gradient(135deg, #3572A5, #58a6ff); border-radius: 5px; display: flex; align-items: center; justify-content: center; font-size: 14px; }
+    .badge { display: flex; align-items: center; gap: 5px; padding: 2px 8px; border-radius: 20px; font-size: 11px; background: rgba(255,255,255,.05); border: 1px solid var(--border); }
+    .dot { width: 6px; height: 6px; border-radius: 50%; background: var(--yellow); }
     .dot.ready { background: var(--green); }
     .dot.error { background: var(--red); }
     .dot.loading { animation: pulse 1s infinite; }
     @keyframes pulse { 0%,100%{opacity:1} 50%{opacity:.3} }
     .spacer { flex: 1; }
-    .btn { display: flex; align-items: center; gap: 6px; padding: 6px 14px; border-radius: 6px; border: 1px solid var(--border); background: transparent; color: var(--text); font-size: 13px; font-weight: 500; cursor: pointer; transition: all .15s; }
+    .btn { display: flex; align-items: center; gap: 5px; padding: 5px 12px; border-radius: 5px; border: 1px solid var(--border); background: transparent; color: var(--text); font-size: 12px; font-weight: 500; cursor: pointer; transition: all .15s; }
     .btn:hover { background: rgba(255,255,255,.06); border-color: var(--accent); }
     .btn:disabled { opacity: .4; cursor: not-allowed; }
     .btn-run { background: var(--accent-dim); border-color: var(--accent); color: #fff; font-weight: 600; }
     .btn-run:hover:not(:disabled) { background: var(--accent); }
-    .examples { display: flex; gap: 6px; }
-    .ex { padding: 2px 8px; border-radius: 4px; border: 1px solid var(--border); background: transparent; color: var(--text-dim); font-size: 11px; cursor: pointer; transition: all .15s; }
+    .btn-clear { color: var(--text-dim); }
+    .examples { display: flex; gap: 4px; }
+    .ex { padding: 2px 7px; border-radius: 4px; border: 1px solid var(--border); background: transparent; color: var(--text-dim); font-size: 11px; cursor: pointer; transition: all .15s; }
     .ex:hover { color: var(--text); border-color: var(--accent); }
 
+    /* Layout */
     main { flex: 1; display: grid; grid-template-columns: 1fr 1fr; grid-template-rows: 1fr auto; overflow: hidden; }
     .pane { display: flex; flex-direction: column; overflow: hidden; }
     .pane + .pane { border-left: 1px solid var(--border); }
-    .pane-header { display: flex; align-items: center; gap: 8px; padding: 6px 12px; background: var(--surface); border-bottom: 1px solid var(--border); font-size: 12px; color: var(--text-dim); flex-shrink: 0; }
+    .pane-header { display: flex; align-items: center; gap: 6px; padding: 5px 10px; background: var(--surface); border-bottom: 1px solid var(--border); font-size: 11px; color: var(--text-dim); flex-shrink: 0; }
     .pane-header span { font-weight: 500; color: var(--text); }
-    #editor { flex: 1; font-family: var(--font-mono); font-size: 14px; line-height: 1.6; padding: 16px; background: var(--bg); color: var(--text); border: none; outline: none; resize: none; tab-size: 4; }
-    #output { flex: 1; font-family: var(--font-mono); font-size: 13px; line-height: 1.6; padding: 16px; background: var(--bg); overflow: auto; white-space: pre-wrap; word-break: break-word; }
+
+    /* Editor */
+    #editor { flex: 1; font-family: var(--font-mono); font-size: 13px; line-height: 1.6; padding: 14px; background: var(--bg); color: var(--text); border: none; outline: none; resize: none; tab-size: 4; }
+
+    /* Output tabs */
+    .output-pane { display: flex; flex-direction: column; overflow: hidden; }
+    .tabs { display: flex; background: var(--surface); border-bottom: 1px solid var(--border); flex-shrink: 0; }
+    .tab { padding: 5px 14px; font-size: 11px; cursor: pointer; color: var(--text-dim); border-bottom: 2px solid transparent; transition: all .15s; }
+    .tab.active { color: var(--text); border-bottom-color: var(--accent); }
+    .tab:hover:not(.active) { color: var(--text); }
+    .tab-panel { flex: 1; overflow: auto; display: none; }
+    .tab-panel.active { display: flex; flex-direction: column; }
+
+    /* Console output */
+    #console-out { flex: 1; font-family: var(--font-mono); font-size: 12px; line-height: 1.6; padding: 12px; white-space: pre-wrap; word-break: break-word; overflow: auto; }
     .out-stdout { color: var(--text); }
     .out-stderr { color: var(--red); }
     .out-info   { color: var(--text-dim); font-style: italic; }
     .out-ok     { color: var(--green); }
     .out-err    { color: var(--red); font-weight: 600; }
+    .out-pip    { color: var(--purple); }
 
-    .statusbar { grid-column: 1/-1; display: flex; align-items: center; gap: 16px; padding: 4px 12px; background: var(--accent-dim); font-size: 11px; color: rgba(255,255,255,.85); flex-shrink: 0; }
+    /* pip panel */
+    #pip-panel { padding: 12px; display: flex; flex-direction: column; gap: 8px; overflow: auto; }
+    .pip-input-row { display: flex; gap: 6px; }
+    #pip-input { flex: 1; background: var(--bg); border: 1px solid var(--border); border-radius: 5px; padding: 6px 10px; color: var(--text); font-size: 12px; font-family: var(--font-mono); outline: none; }
+    #pip-input:focus { border-color: var(--accent); }
+    #pip-input::placeholder { color: var(--text-dim); }
+    .btn-pip { background: var(--purple); border-color: var(--purple); color: #fff; }
+    .btn-pip:hover:not(:disabled) { opacity: .85; }
+    #pip-log { font-family: var(--font-mono); font-size: 11px; color: var(--text-dim); line-height: 1.6; }
+    .pip-ok { color: var(--green); }
+    .pip-err { color: var(--red); }
+    .pip-info { color: var(--purple); }
+    .pip-installed { display: flex; flex-wrap: wrap; gap: 4px; margin-top: 4px; }
+    .pip-tag { padding: 1px 7px; border-radius: 10px; background: rgba(188,140,255,.15); border: 1px solid rgba(188,140,255,.3); font-size: 10px; color: var(--purple); }
 
-    #overlay { position: fixed; inset: 0; background: rgba(13,17,23,.92); display: flex; flex-direction: column; align-items: center; justify-content: center; gap: 16px; z-index: 100; backdrop-filter: blur(4px); }
+    /* Status bar */
+    .statusbar { grid-column: 1/-1; display: flex; align-items: center; gap: 12px; padding: 3px 10px; background: var(--accent-dim); font-size: 10px; color: rgba(255,255,255,.8); flex-shrink: 0; }
+
+    /* Overlay */
+    #overlay { position: fixed; inset: 0; background: rgba(13,17,23,.92); display: flex; flex-direction: column; align-items: center; justify-content: center; gap: 14px; z-index: 100; backdrop-filter: blur(4px); }
     #overlay.hidden { display: none; }
-    .spinner { width: 40px; height: 40px; border: 3px solid var(--border); border-top-color: var(--accent); border-radius: 50%; animation: spin .8s linear infinite; }
+    .spinner { width: 36px; height: 36px; border: 3px solid var(--border); border-top-color: var(--accent); border-radius: 50%; animation: spin .8s linear infinite; }
     @keyframes spin { to { transform: rotate(360deg); } }
-    .ov-title { color: var(--text); font-size: 16px; font-weight: 600; }
-    .ov-sub   { color: var(--text-dim); font-size: 13px; }
+    .ov-title { color: var(--text); font-size: 15px; font-weight: 600; }
+    .ov-sub   { color: var(--text-dim); font-size: 12px; }
   </style>
 </head>
 <body>
@@ -66,63 +100,89 @@
 </div>
 
 <header>
-  <div class="logo"><div class="logo-icon">🐍</div>Python WASM — Custom Runtime</div>
+  <div class="logo"><div class="logo-icon">🐍</div>Python WASM</div>
   <div class="badge"><div class="dot loading" id="dot"></div><span id="status-text">Loading...</span></div>
   <div class="spacer"></div>
   <div class="examples">
     <button class="ex" onclick="loadEx('hello')">Hello</button>
     <button class="ex" onclick="loadEx('fib')">Fibonacci</button>
     <button class="ex" onclick="loadEx('files')">Files</button>
-    <button class="ex" onclick="loadEx('sys')">Sys info</button>
+    <button class="ex" onclick="loadEx('stdlib')">Stdlib</button>
   </div>
-  <button class="btn" onclick="clearOut()">Clear</button>
+  <button class="btn btn-clear" onclick="clearOut()">Clear</button>
   <button class="btn btn-run" id="run-btn" onclick="runCode()" disabled>▶ Run</button>
 </header>
 
 <main>
   <div class="pane">
-    <div class="pane-header">📄 <span>main.py</span><span style="margin-left:auto;font-size:11px">Ctrl+Enter</span></div>
-    <textarea id="editor" spellcheck="false">print("Hello from our custom Python WASM! 🐍")
+    <div class="pane-header">📄 <span>main.py</span><span style="margin-left:auto">Ctrl+Enter</span></div>
+    <textarea id="editor" spellcheck="false">print("Hello from Python WASM! 🐍")
 
 import sys
-print(f"Python {sys.version}")
+print(f"Python {sys.version[:6]}")
 print(f"Platform: {sys.platform}")
 
-# Math
 result = sum(i**2 for i in range(10))
 print(f"Sum of squares 0-9: {result}")
 </textarea>
   </div>
-  <div class="pane">
-    <div class="pane-header">💻 <span>Output</span><span id="exec-time" style="margin-left:auto;font-size:11px"></span></div>
-    <div id="output"></div>
+
+  <div class="output-pane">
+    <div class="tabs">
+      <div class="tab active" onclick="switchTab('console')">💻 Console</div>
+      <div class="tab" onclick="switchTab('pip')">📦 pip</div>
+    </div>
+
+    <div class="tab-panel active" id="tab-console">
+      <div id="console-out"></div>
+    </div>
+
+    <div class="tab-panel" id="tab-pip">
+      <div id="pip-panel">
+        <div class="pip-input-row">
+          <input id="pip-input" type="text" placeholder="package name (e.g. six, attrs, requests)" />
+          <button class="btn btn-pip" id="pip-btn" onclick="pipInstall()" disabled>Install</button>
+        </div>
+        <div id="pip-log"></div>
+        <div id="pip-installed" class="pip-installed"></div>
+      </div>
+    </div>
   </div>
+
   <div class="statusbar">
-    <span id="sb-text">Initializing custom Python WASM runtime...</span>
-    <span id="sb-exports" style="margin-left:auto"></span>
+    <span id="sb-text">Initializing...</span>
+    <span id="exec-time" style="margin-left:auto"></span>
   </div>
 </main>
 
 <script>
 const EXAMPLES = {
-  hello: `print("Hello from our custom Python WASM! 🐍")\n\nimport sys\nprint(f"Python {sys.version}")\nprint(f"Platform: {sys.platform}")\n`,
-  fib: `def fib(n):\n    a, b = 0, 1\n    for _ in range(n):\n        yield a\n        a, b = b, a+b\n\nresult = list(fib(15))\nprint("Fibonacci:", result)\nprint("Sum:", sum(result))\n`,
+  hello: `print("Hello from Python WASM! 🐍")\n\nimport sys\nprint(f"Python {sys.version[:6]}")\nprint(f"Platform: {sys.platform}")\n`,
+  fib: `def fib(n):\n    a, b = 0, 1\n    for _ in range(n):\n        yield a\n        a, b = b, a+b\n\nprint(list(fib(15)))\n`,
   files: `import os\n\nwith open('/home/user/test.txt', 'w') as f:\n    f.write("Hello from Python WASM!\\n")\n\nwith open('/home/user/test.txt') as f:\n    print(f.read())\n\nprint("Files:", os.listdir('/home/user'))\n`,
-  sys: `import sys\nprint("Version:", sys.version)\nprint("Platform:", sys.platform)\nprint("Path:", sys.path[:3])\nprint("Modules:", len(sys.modules))\n`,
+  stdlib: `import math, random, json, re, datetime\n\nprint("math.pi:", math.pi)\nprint("random:", random.randint(1, 100))\nprint("json:", json.dumps({"hello": "world"}))\nprint("regex:", re.findall(r'\\w+', 'hello world'))\nprint("date:", datetime.date.today())\n`,
 };
 
 function loadEx(name) { document.getElementById('editor').value = EXAMPLES[name] || ''; }
 
-// ── Output ────────────────────────────────────────────────────────────────────
+// ── Tabs ──────────────────────────────────────────────────────────────────────
+function switchTab(name) {
+  document.querySelectorAll('.tab').forEach((t, i) => t.classList.toggle('active', ['console','pip'][i] === name));
+  document.querySelectorAll('.tab-panel').forEach(p => p.classList.remove('active'));
+  document.getElementById('tab-' + name).classList.add('active');
+}
+
+// ── Console output ────────────────────────────────────────────────────────────
 function out(text, cls) {
   const el = document.createElement('span');
   el.className = cls;
   el.textContent = text;
-  document.getElementById('output').appendChild(el);
-  document.getElementById('output').scrollTop = 9999;
+  document.getElementById('console-out').appendChild(el);
+  document.getElementById('console-out').scrollTop = 9999;
 }
+
 function clearOut() {
-  document.getElementById('output').innerHTML = '';
+  document.getElementById('console-out').innerHTML = '';
   document.getElementById('exec-time').textContent = '';
 }
 
@@ -130,9 +190,9 @@ function clearOut() {
 function setStatus(text, state) {
   document.getElementById('status-text').textContent = text;
   document.getElementById('sb-text').textContent = text;
+  document.getElementById('ov-status').textContent = text;
   const dot = document.getElementById('dot');
   dot.className = 'dot ' + (state === 'ready' ? 'ready' : state === 'error' ? 'error' : 'loading');
-  document.getElementById('ov-status').textContent = text;
 }
 
 // ── Worker ────────────────────────────────────────────────────────────────────
@@ -147,38 +207,38 @@ worker.onmessage = (e) => {
   } else if (msg.type === 'ready') {
     document.getElementById('overlay').classList.add('hidden');
     document.getElementById('run-btn').disabled = false;
-    setStatus('Python WASM ready ✓', 'ready');
+    document.getElementById('pip-btn').disabled = false;
+    setStatus('Python 3.13 WASM ready', 'ready');
     out('Custom Python WASM runtime ready ✓\n', 'out-ok');
     out('─'.repeat(50) + '\n', 'out-info');
   } else if (msg.type === 'stdout') {
     out(msg.data, 'out-stdout');
   } else if (msg.type === 'stderr') {
     out(msg.data, 'out-stderr');
+  } else if (msg.type === 'pip.status') {
+    pipLog(msg.data, 'pip-info');
   } else if (msg.type === 'result') {
+    const p = pending.get(msg.id);
+    if (p) { p.resolve(msg.value); pending.delete(msg.id); }
+  } else if (msg.type === 'pip.result') {
     const p = pending.get(msg.id);
     if (p) { p.resolve(msg.value); pending.delete(msg.id); }
   } else if (msg.type === 'error') {
     const p = pending.get(msg.id);
     if (p) { p.reject(msg.error); pending.delete(msg.id); }
     else {
-      // Init error
       document.getElementById('overlay').classList.add('hidden');
       setStatus('Error: ' + msg.error.message, 'error');
       out('ERROR: ' + msg.error.message + '\n', 'out-err');
-      if (msg.error.traceback) out(msg.error.traceback + '\n', 'out-stderr');
-      // Show available exports hint
-      if (msg.error.message.includes('exports')) {
-        document.getElementById('sb-exports').textContent = msg.error.message;
-      }
     }
   }
 };
 
-function sendRun(code) {
+function send(msg) {
   return new Promise((resolve, reject) => {
     const id = String(++reqId);
     pending.set(id, { resolve, reject });
-    worker.postMessage({ type: 'run', id, code });
+    worker.postMessage({ ...msg, id });
   });
 }
 
@@ -190,22 +250,67 @@ async function runCode() {
   if (!code.trim()) return;
   running = true;
   document.getElementById('run-btn').disabled = true;
+
+  // Clear output on each run
+  clearOut();
+
   setStatus('Running...', 'loading');
   const t0 = performance.now();
   try {
-    await sendRun(code);
+    await send({ type: 'run', code });
     const ms = (performance.now() - t0).toFixed(1);
     document.getElementById('exec-time').textContent = ms + 'ms';
     setStatus('Done in ' + ms + 'ms', 'ready');
   } catch (err) {
     const ms = (performance.now() - t0).toFixed(1);
     out('\n' + (err.type || 'Error') + ': ' + err.message + '\n', 'out-err');
-    if (err.traceback) out(err.traceback + '\n', 'out-stderr');
     document.getElementById('exec-time').textContent = ms + 'ms';
     setStatus('Error', 'error');
   }
   running = false;
   document.getElementById('run-btn').disabled = false;
+}
+
+// ── pip ───────────────────────────────────────────────────────────────────────
+const installedTags = new Set();
+
+function pipLog(text, cls = '') {
+  const el = document.createElement('div');
+  el.className = cls;
+  el.textContent = text;
+  document.getElementById('pip-log').appendChild(el);
+  document.getElementById('pip-panel').scrollTop = 9999;
+}
+
+async function pipInstall() {
+  const input = document.getElementById('pip-input');
+  const pkg = input.value.trim();
+  if (!pkg) return;
+
+  document.getElementById('pip-btn').disabled = true;
+  switchTab('pip');
+  pipLog(`\n$ pip install ${pkg}`, 'pip-info');
+
+  try {
+    const result = await send({ type: 'pip.install', package: pkg });
+    if (result) {
+      pipLog(`✓ Successfully installed ${result.name} ${result.version}`, 'pip-ok');
+      if (!installedTags.has(result.name)) {
+        installedTags.add(result.name);
+        const tag = document.createElement('span');
+        tag.className = 'pip-tag';
+        tag.textContent = `${result.name} ${result.version}`;
+        document.getElementById('pip-installed').appendChild(tag);
+      }
+    } else {
+      pipLog(`✓ Already installed or skipped`, 'pip-ok');
+    }
+    input.value = '';
+  } catch (err) {
+    pipLog(`✗ Error: ${err.message}`, 'pip-err');
+  }
+
+  document.getElementById('pip-btn').disabled = false;
 }
 
 // ── Keyboard ──────────────────────────────────────────────────────────────────
@@ -219,6 +324,9 @@ document.getElementById('editor').addEventListener('keydown', e => {
     t.value = t.value.slice(0, s) + '    ' + t.value.slice(t.selectionEnd);
     t.selectionStart = t.selectionEnd = s + 4;
   }
+});
+document.getElementById('pip-input').addEventListener('keydown', e => {
+  if (e.key === 'Enter') pipInstall();
 });
 </script>
 </body>

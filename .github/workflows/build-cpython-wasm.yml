@@ -142,7 +142,10 @@ jobs:
           echo "=== make-build-python ==="
           python3 Tools/wasm/wasi.py make-build-python
 
-          echo "=== configure-host ==="
+          echo "=== configure-host (with dynamic export flags) ==="
+          # Add export-dynamic so C-extensions can link against Python C API
+          WASI_SDK_PATH=/opt/wasi-sdk \
+          LDFLAGS="-Wl,--export-dynamic -Wl,--export=PyArg_ParseTuple -Wl,--export=PyLong_FromLong -Wl,--export=PyModule_Create2 -Wl,--export=PyErr_SetString -Wl,--export=PyErr_NoMemory -Wl,--export=Py_BuildValue -Wl,--export=PyArg_ParseTupleAndKeywords -Wl,--export=PyList_New -Wl,--export=PyList_Append -Wl,--export=PyDict_New -Wl,--export=PyDict_SetItemString -Wl,--export=PyUnicode_FromString -Wl,--export=PyFloat_FromDouble -Wl,--export=PyBool_FromLong -Wl,--export=PyTuple_New -Wl,--export=PyTuple_SetItem -Wl,--export=PyObject_CallObject -Wl,--export=PyImport_ImportModule -Wl,--export=PyType_Ready -Wl,--export=PyModule_AddObject -Wl,--export=PyMem_Malloc -Wl,--export=PyMem_Free -Wl,--export=malloc -Wl,--export=free" \
           python3 Tools/wasm/wasi.py configure-host
 
           echo "=== make-host ==="
@@ -150,6 +153,12 @@ jobs:
 
           echo "=== .wasm files ==="
           find /tmp/cpython -name "*.wasm" -ls 2>/dev/null || echo "No .wasm found"
+
+          echo "=== Check exports ==="
+          WASM=$(find /tmp/cpython -name "*.wasm" | head -1)
+          if [ -n "$WASM" ]; then
+            /opt/wasi-sdk/bin/llvm-nm "$WASM" 2>/dev/null | grep -c "^[0-9a-f]* T Py" || echo "0 Py* exports"
+          fi
 
       # ── 8. Package artifacts ─────────────────────────────────────────────────
       - name: Package artifacts

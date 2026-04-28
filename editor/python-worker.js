@@ -49,6 +49,8 @@ function readFile(path) {
 
 // Pre-create dirs
 for (const d of ['/', '/home', '/home/user', '/tmp', '/usr', '/usr/lib',
+  '/usr/lib/python3.13', '/usr/lib/python3.13/lib-dynload',
+  '/usr/lib/python3.13/site-packages',
   '/usr/local', '/usr/local/lib', '/usr/local/lib/python3.13',
   '/usr/local/lib/python3.13/site-packages']) mkdir(d);
 
@@ -236,8 +238,16 @@ function buildWasi(getMem, args, envVars, onStdout, onStderr, checkInt) {
 
     path_open(dirfd, _df, pathPtr, pathLen, oflags, _rb, _ri, _ff, openedFdPtr) {
       const rel = str(pathPtr, pathLen);
-      const base = dirfd === 4 ? '/home/user' : '/';
+      let base;
+      if (dirfd === 3) base = '/';
+      else if (dirfd === 4) base = '/home/user';
+      else {
+        const desc = fds.get(dirfd);
+        base = desc ? desc.path : '/';
+      }
       const p = norm(rel.startsWith('/') ? rel : base + '/' + rel);
+      const exists = vfsNodes.has(p);
+      console.log(`[path_open] dirfd=${dirfd} base="${base}" rel="${rel}" -> "${p}" exists=${exists} oflags=${oflags}`);
       const fd = fdOpen(p, oflags);
       if (fd < 0) return ENOENT;
       dv().setUint32(openedFdPtr, fd, true); return ESUCCESS;
@@ -245,21 +255,21 @@ function buildWasi(getMem, args, envVars, onStdout, onStderr, checkInt) {
 
     path_create_directory(dirfd, pathPtr, pathLen) {
       const rel = str(pathPtr, pathLen);
-      const base = dirfd === 4 ? '/home/user' : '/';
+      const base = dirfd === 3 ? '/' : dirfd === 4 ? '/home/user' : (fds.get(dirfd)?.path ?? '/');
       mkdir(norm(rel.startsWith('/') ? rel : base + '/' + rel));
       return ESUCCESS;
     },
 
     path_unlink_file(dirfd, pathPtr, pathLen) {
       const rel = str(pathPtr, pathLen);
-      const base = dirfd === 4 ? '/home/user' : '/';
+      const base = dirfd === 3 ? '/' : dirfd === 4 ? '/home/user' : (fds.get(dirfd)?.path ?? '/');
       vfsNodes.delete(norm(rel.startsWith('/') ? rel : base + '/' + rel));
       return ESUCCESS;
     },
 
     path_filestat_get(dirfd, _flags, pathPtr, pathLen, statPtr) {
       const rel = str(pathPtr, pathLen);
-      const base = dirfd === 4 ? '/home/user' : '/';
+      const base = dirfd === 3 ? '/' : dirfd === 4 ? '/home/user' : (fds.get(dirfd)?.path ?? '/');
       const p = norm(rel.startsWith('/') ? rel : base + '/' + rel);
       const node = vfsNodes.get(p); if (!node) return ENOENT;
       const d = dv(); const t = BigInt(node.mtime) * 1_000_000n;
@@ -275,7 +285,6 @@ function buildWasi(getMem, args, envVars, onStdout, onStderr, checkInt) {
     },
 
     fd_readdir(fd, bufPtr, bufLen, _cookie, bufusedPtr) {
-      // Return directory entries
       const desc = fds.get(fd);
       if (!desc || desc.node.type !== 'dir') { dv().setUint32(bufusedPtr, 0, true); return ESUCCESS; }
       const enc = new TextEncoder();
@@ -286,15 +295,19 @@ function buildWasi(getMem, args, envVars, onStdout, onStderr, checkInt) {
         const name = entries[idx];
         const nameBytes = enc.encode(name);
         const entrySize = 24 + nameBytes.length;
-        if (written + entrySize > bufLen) break;
+        if (written + entrySize > bufLen) {
+          // Buffer full — signal to caller that there's more by filling buffer completely
+          dv().setUint32(bufusedPtr, bufLen, true);
+          return ESUCCESS;
+        }
         const base = bufPtr + written;
         const childPath = desc.path === '/' ? '/' + name : desc.path + '/' + name;
         const childNode = vfsNodes.get(norm(childPath));
         const ft = childNode?.type === 'dir' ? 3 : 4;
-        dv().setBigUint64(base,      BigInt(idx + 1), true); // d_next
-        dv().setBigUint64(base + 8,  BigInt(idx + 1), true); // d_ino
-        dv().setUint32(base + 16,    nameBytes.length, true); // d_namlen
-        dv().setUint8(base + 20,     ft);                     // d_type
+        dv().setBigUint64(base,      BigInt(idx + 1), true);
+        dv().setBigUint64(base + 8,  BigInt(idx + 1), true);
+        dv().setUint32(base + 16,    nameBytes.length, true);
+        dv().setUint8(base + 20,     ft);
         m8().set(nameBytes, base + 24);
         written += entrySize;
       }
@@ -386,16 +399,92 @@ async function loadStdlib() {
   const bytes = new Uint8Array(await resp.arrayBuffer());
   self.postMessage({ type: 'status', text: 'Extracting stdlib...' });
   const files = parseZip(bytes);
-  let count = 0;
+  let count = 0, skipped = 0;
+  let firstError = null;
   for (const [name, data] of files) {
     const dest = '/usr/lib/python3.13/' + (name.startsWith('Lib/') ? name.slice(4) : name);
     try {
       const content = data instanceof Uint8Array ? data : await inflate(data.compressed);
       writeFile(dest, content);
       count++;
-    } catch { /* skip */ }
+    } catch(e) {
+      skipped++;
+      if (!firstError) firstError = `${name}: ${e.message}`;
+    }
   }
-  self.postMessage({ type: 'stdout', data: `stdlib: ${count} files extracted\n` });
+  // Create empty python313.zip placeholder so Python doesn't complain
+  const emptyZip = new Uint8Array([0x50,0x4B,0x05,0x06,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0]);
+  writeFile('/usr/lib/python313.zip', emptyZip);
+  self.postMessage({ type: 'stdout', data: `stdlib: ${count} extracted, ${skipped} skipped${firstError ? ' | first error: ' + firstError : ''}\n` });
+}
+
+// ── pip ───────────────────────────────────────────────────────────────────────
+
+const SITE_PACKAGES = '/usr/local/lib/python3.13/site-packages';
+const installedPackages = new Set();
+
+async function pipInstall(packageName) {
+  const pkg = packageName.toLowerCase().trim();
+  if (installedPackages.has(pkg)) return null;
+  installedPackages.add(pkg);
+
+  self.postMessage({ type: 'pip.status', data: `Installing ${pkg}...` });
+
+  const resp = await fetch(`https://pypi.org/pypi/${pkg}/json`);
+  if (!resp.ok) throw new Error(`Package not found: ${pkg}`);
+  const meta = await resp.json();
+
+  const version = meta.info.version;
+  const name = meta.info.name;
+
+  // Install dependencies first
+  const requires = meta.info.requires_dist || [];
+  for (const req of requires) {
+    if (req.includes('; extra ==')) continue;
+    if (req.includes('; sys_platform')) continue;
+    if (req.includes('; python_version')) continue;
+    const depName = req.split(/[>=<!;\s\[]/)[0].trim().toLowerCase();
+    if (depName && !installedPackages.has(depName)) {
+      try { await pipInstall(depName); } catch { /* skip optional deps */ }
+    }
+  }
+
+  // Find pure-Python wheel
+  const urls = meta.urls || [];
+  let wheelUrl = null;
+  for (const u of urls) {
+    if (u.packagetype === 'bdist_wheel' && u.filename.endsWith('-none-any.whl')) {
+      wheelUrl = u.url; break;
+    }
+  }
+  if (!wheelUrl) {
+    for (const u of urls) {
+      if (u.packagetype === 'bdist_wheel') { wheelUrl = u.url; break; }
+    }
+  }
+  if (!wheelUrl) {
+    self.postMessage({ type: 'pip.status', data: `Skipped ${pkg} (no wheel)` });
+    return null;
+  }
+
+  // Download and extract
+  const wheelResp = await fetch(wheelUrl);
+  if (!wheelResp.ok) throw new Error(`Download failed: ${wheelResp.status}`);
+  const wheelBytes = new Uint8Array(await wheelResp.arrayBuffer());
+
+  const files = parseZip(wheelBytes);
+  let count = 0;
+  for (const [fname, data] of files) {
+    const dest = `${SITE_PACKAGES}/${fname}`;
+    try {
+      const content = data instanceof Uint8Array ? data : await inflate(data.compressed);
+      writeFile(dest, content);
+      count++;
+    } catch { }
+  }
+
+  self.postMessage({ type: 'pip.status', data: `Installed ${name} ${version} (${count} files)` });
+  return { name, version };
 }
 
 // ── Main ──────────────────────────────────────────────────────────────────────
@@ -425,14 +514,23 @@ function runCode(code, id) {
     return;
   }
 
+  // Reset file descriptors for each run — new WASM instance gets fresh fds
+  fds.clear();
+  nextFd = 5;
+
+  // Debug: check random.py in VFS
+  const randomPath = '/usr/lib/python3.13/random.py';
+  const dirNode = vfsNodes.get('/usr/lib/python3.13');
+  console.log(`[runCode] VFS has random.py: ${vfsNodes.has(randomPath)}, total nodes: ${vfsNodes.size}`);
+  console.log(`[runCode] /usr/lib/python3.13 children has random.py: ${dirNode?.children?.has('random.py')}, children count: ${dirNode?.children?.size}`);
+
   const codeWithFlush = code + '\nimport sys as _sys\n_sys.stdout.flush()\n_sys.stderr.flush()\n';
   writeFile('/tmp/run.py', codeWithFlush);
-  const runArgs = ['python3', '-c', "exec(open('/tmp/run.py').read()); import sys; sys.stdout.flush(); sys.stderr.flush()"];
-  // Memory holder — will be set once instance is created
+  const runArgs = ['python3', '-c', "exec(open('/tmp/run.py').read()); import sys; sys.stdout.flush(); sys.stderr.flush()"];  // Memory holder — will be set once instance is created
   let mem = null;
   const getMem = () => mem;
 
-  const envVars = ['PYTHONPATH=/usr/lib/python3.13', 'PYTHONHOME=/usr', 'PYTHONUNBUFFERED=1'];
+  const envVars = ['PYTHONPATH=/usr/lib/python3.13:/usr/local/lib/python3.13/site-packages', 'PYTHONHOME=/usr', 'PYTHONUNBUFFERED=1'];
   const onStdout = (s) => self.postMessage({ type: 'stdout', data: s });
   const onStderr = (s) => self.postMessage({ type: 'stderr', data: s });
   const checkInt = () => {};
@@ -461,6 +559,14 @@ function runCode(code, id) {
 self.onmessage = async (e) => {
   const { type, id, code, path, content } = e.data;
   if (type === 'run') runCode(code, id);
+  else if (type === 'pip.install') {
+    try {
+      const result = await pipInstall(e.data.package);
+      self.postMessage({ type: 'pip.result', id, value: result });
+    } catch(err) {
+      self.postMessage({ type: 'error', id, error: { type: err.name, message: err.message, traceback: '' } });
+    }
+  }
   else if (type === 'fs.write') { writeFile(path, content); self.postMessage({ type: 'fs.result', id, value: null }); }
   else if (type === 'fs.read')  { self.postMessage({ type: 'fs.result', id, value: readFile(path) }); }
 };
