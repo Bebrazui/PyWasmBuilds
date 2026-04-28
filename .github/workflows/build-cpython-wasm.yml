@@ -143,9 +143,26 @@ jobs:
           python3 Tools/wasm/wasi.py make-build-python
 
           echo "=== configure-host (with dynamic export flags) ==="
-          # Add export-dynamic so C-extensions can link against Python C API
+          # Patch wasi.py to add --export-dynamic to linker flags
+          # This allows C-extensions to link against Python C API at runtime
+          python3 -c "
+import re, sys
+with open('Tools/wasm/wasi.py', 'r') as f:
+    src = f.read()
+# Add --export-dynamic to the configure call for host
+# Find the configure call and add LDFLAGS
+old = 'configure,\n'
+new = 'configure,\n'
+# Instead, patch the env_additions to include LDFLAGS
+src = src.replace(
+    'env_additions | wasi_sdk_env(context)',
+    'env_additions | wasi_sdk_env(context) | {\"LDFLAGS\": \"-Wl,--export-dynamic\"}'
+)
+with open('Tools/wasm/wasi.py', 'w') as f:
+    f.write(src)
+print('Patched wasi.py')
+"
           WASI_SDK_PATH=/opt/wasi-sdk \
-          LDFLAGS="-Wl,--export-dynamic -Wl,--export=PyArg_ParseTuple -Wl,--export=PyLong_FromLong -Wl,--export=PyModule_Create2 -Wl,--export=PyErr_SetString -Wl,--export=PyErr_NoMemory -Wl,--export=Py_BuildValue -Wl,--export=PyArg_ParseTupleAndKeywords -Wl,--export=PyList_New -Wl,--export=PyList_Append -Wl,--export=PyDict_New -Wl,--export=PyDict_SetItemString -Wl,--export=PyUnicode_FromString -Wl,--export=PyFloat_FromDouble -Wl,--export=PyBool_FromLong -Wl,--export=PyTuple_New -Wl,--export=PyTuple_SetItem -Wl,--export=PyObject_CallObject -Wl,--export=PyImport_ImportModule -Wl,--export=PyType_Ready -Wl,--export=PyModule_AddObject -Wl,--export=PyMem_Malloc -Wl,--export=PyMem_Free -Wl,--export=malloc -Wl,--export=free" \
           python3 Tools/wasm/wasi.py configure-host
 
           echo "=== make-host ==="
