@@ -72,7 +72,7 @@ jobs:
 
           for src in c-extensions/*.c; do
             name=$(basename "$src" .c)
-            echo "Compiling $name..."
+            echo "=== Compiling $name ==="
             /opt/wasi-sdk/bin/clang \
               --target=wasm32-wasi \
               --sysroot=/opt/wasi-sdk/share/wasi-sysroot \
@@ -85,10 +85,13 @@ jobs:
               -Wl,--no-entry \
               -Wl,--export=PyInit_${name} \
               -o /tmp/ext-build/${name}.wasm \
-              "$src" && echo "OK: ${name}.wasm" || echo "FAILED: $name"
+              "$src"
+            echo "OK: $(du -sh /tmp/ext-build/${name}.wasm)"
           done
 
+          echo "=== Built files ==="
           ls -lh /tmp/ext-build/
+          test -n "$(ls /tmp/ext-build/*.wasm 2>/dev/null)" || (echo "ERROR: no .wasm files built" && exit 1)
 
       - name: Upload extension artifacts
         uses: actions/upload-artifact@v4
