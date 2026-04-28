@@ -143,19 +143,9 @@ jobs:
           python3 Tools/wasm/wasi.py make-build-python
 
           echo "=== configure-host (with dynamic export flags) ==="
-          # Write patch script to file to avoid YAML quoting issues
-          cat > /tmp/patch_wasi.py << 'EOF'
-with open('Tools/wasm/wasi.py', 'r') as f:
-    src = f.read()
-patched = src.replace(
-    'env_additions | wasi_sdk_env(context)',
-    'env_additions | wasi_sdk_env(context) | {"LDFLAGS": "-Wl,--export-dynamic"}'
-)
-with open('Tools/wasm/wasi.py', 'w') as f:
-    f.write(patched)
-print('Patched wasi.py: --export-dynamic added')
-EOF
-          python3 /tmp/patch_wasi.py
+          # Patch wasi.py to add --export-dynamic using sed
+          sed -i 's/env_additions | wasi_sdk_env(context)/env_additions | wasi_sdk_env(context) | {"LDFLAGS": "-Wl,--export-dynamic"}/' Tools/wasm/wasi.py
+          grep -q 'export-dynamic' Tools/wasm/wasi.py && echo "Patch applied" || echo "Patch failed"
           WASI_SDK_PATH=/opt/wasi-sdk python3 Tools/wasm/wasi.py configure-host
 
           echo "=== make-host ==="
