@@ -91,7 +91,8 @@ jobs:
           echo "WASI pyconfig.h: $PYCONFIG"
           echo "PYCONFIG_DIR=$(dirname $PYCONFIG)" >> $GITHUB_ENV
 
-      - name: Compile C extensions to WASM        run: |
+      - name: Compile C extensions to WASM
+        run: |
           mkdir -p /tmp/ext-build
 
           for src in c-extensions/*.c; do
