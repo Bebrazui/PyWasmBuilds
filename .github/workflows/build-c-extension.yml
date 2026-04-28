@@ -113,12 +113,21 @@ jobs:
               -I/tmp/cpython/Include/cpython \
               -I${{ env.PYCONFIG_DIR }} \
               -DPy_BUILD_CORE_BUILTIN=1 \
+              -fPIC \
               -O2 \
-              -shared \
-              -Wl,--no-entry \
-              -Wl,--export=PyInit_${name} \
-              -o /tmp/ext-build/${name}.wasm \
+              -c \
+              -o /tmp/ext-build/${name}.o \
               "$src"
+
+            /opt/wasi-sdk/bin/wasm-ld \
+              --no-entry \
+              --export-dynamic \
+              --import-undefined \
+              --experimental-pic \
+              -shared \
+              -o /tmp/ext-build/${name}.wasm \
+              /tmp/ext-build/${name}.o
+
             echo "OK: $(du -sh /tmp/ext-build/${name}.wasm)"
           done
 

@@ -93,6 +93,21 @@ export class PythonRuntime {
   }
 
   /**
+   * Install a Python package from PyPI.
+   * Supports pure-Python packages and resolves dependencies automatically.
+   */
+  async pip(packageName: string): Promise<{ name: string; version: string } | null> {
+    if (!this.ready || !this.worker) {
+      return Promise.reject(new Error('PythonRuntime not initialized. Call init() first.'));
+    }
+    const id = String(++this.runCounter);
+    return new Promise((resolve, reject) => {
+      this.pendingRuns.set(id, { resolve: resolve as (r: RunResult) => void, reject });
+      this.worker!.postMessage({ type: 'pip.install', id, package: packageName });
+    }) as unknown as Promise<{ name: string; version: string } | null>;
+  }
+
+  /**
    * Run Python code. Returns when execution completes.
    */
   run(code: string): Promise<RunResult> {
@@ -148,6 +163,18 @@ export class PythonRuntime {
         }
         break;
       }
+      case 'pip.result': {
+        const pending = this.pendingRuns.get(msg.id);
+        if (pending) {
+          pending.resolve(msg.value as unknown as RunResult);
+          this.pendingRuns.delete(msg.id);
+        }
+        break;
+      }
+      case 'pip.status': {
+        this.onStderr('[pip] ' + msg.data + '\n');
+        break;
+      }
       case 'error': {
         const pending = this.pendingRuns.get(msg.id);
         if (pending) {
@@ -168,4 +195,6 @@ type WorkerMessage =
   | { type: 'stdout'; data: string }
   | { type: 'stderr'; data: string }
   | { type: 'result'; id: string }
+  | { type: 'pip.result'; id: string; value: unknown }
+  | { type: 'pip.status'; data: string }
   | { type: 'error'; id: string; error: { message: string } };

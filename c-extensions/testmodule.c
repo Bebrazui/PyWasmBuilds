@@ -18,9 +18,9 @@ static PyMethodDef TestMethods[] = {
 };
 
 static struct PyModuleDef testmodule = {
-    PyModuleDef_HEAD_INIT, "_testcext", NULL, -1, TestMethods
+    PyModuleDef_HEAD_INIT, "testmodule", NULL, -1, TestMethods
 };
 
-PyMODINIT_FUNC PyInit__testcext(void) {
+PyMODINIT_FUNC PyInit_testmodule(void) {
     return PyModule_Create(&testmodule);
 }

@@ -1,0 +1,200 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>cpython-wasm library test</title>
+  <style>
+    * { box-sizing: border-box; margin: 0; padding: 0; }
+    body { background: #0d1117; color: #e6edf3; font-family: monospace; padding: 20px; }
+    h1 { color: #58a6ff; margin-bottom: 20px; font-size: 18px; }
+    .test { margin-bottom: 12px; padding: 10px 14px; border-radius: 6px; border: 1px solid #30363d; background: #161b22; }
+    .test-name { color: #8b949e; font-size: 12px; margin-bottom: 6px; }
+    .test-result { font-size: 13px; }
+    .pass { color: #3fb950; }
+    .fail { color: #f85149; }
+    .pending { color: #d29922; }
+    #log { margin-top: 20px; padding: 14px; background: #0d1117; border: 1px solid #30363d; border-radius: 6px; font-size: 12px; line-height: 1.8; white-space: pre-wrap; max-height: 400px; overflow: auto; }
+    #status { margin-bottom: 16px; padding: 8px 14px; border-radius: 6px; background: #1f6feb; color: #fff; font-size: 13px; }
+  </style>
+</head>
+<body>
+<h1>🐍 cpython-wasm library test</h1>
+<div id="status">Loading runtime...</div>
+<div id="tests"></div>
+<div id="log"></div>
+
+<script type="module">
+// Load from local dist for testing
+// In production: import { PythonRuntime } from 'https://cdn.jsdelivr.net/npm/cpython-wasm/dist/index.js'
+import { PythonRuntime } from '../packages/cpython-wasm/dist/index.js';
+
+const log = (msg, color = '#e6edf3') => {
+  const el = document.getElementById('log');
+  el.innerHTML += `<span style="color:${color}">${msg}\n</span>`;
+  el.scrollTop = el.scrollHeight;
+};
+
+const tests = [];
+let passed = 0, failed = 0;
+
+function addTest(name) {
+  const div = document.createElement('div');
+  div.className = 'test';
+  div.innerHTML = `<div class="test-name">${name}</div><div class="test-result pending" id="t-${tests.length}">⏳ running...</div>`;
+  document.getElementById('tests').appendChild(div);
+  const idx = tests.length;
+  tests.push({ name, idx });
+  return idx;
+}
+
+function setResult(idx, ok, msg) {
+  const el = document.getElementById(`t-${idx}`);
+  el.className = `test-result ${ok ? 'pass' : 'fail'}`;
+  el.textContent = (ok ? '✓ ' : '✗ ') + msg;
+  if (ok) passed++; else failed++;
+}
+
+async function run() {
+  const py = new PythonRuntime({
+    wasmUrl: '../editor/python.wasm',
+    stdlibUrl: '../editor/python313-stdlib.zip',
+    workerUrl: '../packages/cpython-wasm/dist/worker.js',
+  });
+
+  py.onStdout = (s) => log(s.trimEnd(), '#e6edf3');
+  py.onStderr = (s) => log(s.trimEnd(), '#f85149');
+
+  document.getElementById('status').textContent = 'Initializing Python WASM...';
+  log('Initializing runtime...', '#58a6ff');
+
+  try {
+    await py.init();
+    document.getElementById('status').textContent = '✓ Runtime ready';
+    document.getElementById('status').style.background = '#238636';
+    log('Runtime ready!\n', '#3fb950');
+  } catch(e) {
+    document.getElementById('status').textContent = '✗ Init failed: ' + e.message;
+    document.getElementById('status').style.background = '#da3633';
+    log('Init failed: ' + e.message, '#f85149');
+    return;
+  }
+
+  // Test 1: Hello World
+  {
+    const idx = addTest('print("Hello World")');
+    try {
+      let out = '';
+      py.onStdout = s => { out += s; log(s.trimEnd()); };
+      await py.run('print("Hello from cpython-wasm!")');
+      setResult(idx, out.includes('Hello'), out.trim() || 'no output');
+    } catch(e) { setResult(idx, false, e.message); }
+  }
+
+  // Test 2: Python version
+  {
+    const idx = addTest('import sys; print(sys.version)');
+    try {
+      let out = '';
+      py.onStdout = s => { out += s; log(s.trimEnd()); };
+      await py.run('import sys; print(sys.version[:6])');
+      setResult(idx, out.includes('3.13'), out.trim() || 'no output');
+    } catch(e) { setResult(idx, false, e.message); }
+  }
+
+  // Test 3: Math
+  {
+    const idx = addTest('sum(i**2 for i in range(10)) == 285');
+    try {
+      let out = '';
+      py.onStdout = s => { out += s; log(s.trimEnd()); };
+      await py.run('print(sum(i**2 for i in range(10)))');
+      setResult(idx, out.trim() === '285', out.trim());
+    } catch(e) { setResult(idx, false, e.message); }
+  }
+
+  // Test 4: import random
+  {
+    const idx = addTest('import random');
+    try {
+      let out = '', err = '';
+      py.onStdout = s => { out += s; log(s.trimEnd()); };
+      py.onStderr = s => { err += s; log(s.trimEnd(), '#f85149'); };
+      await py.run('import random; print(f"random ok: {random.randint(1,100)}")');
+      setResult(idx, out.includes('random ok'), out.trim() || err.trim());
+    } catch(e) { setResult(idx, false, e.message); }
+  }
+
+  // Test 5: import json
+  {
+    const idx = addTest('import json');
+    try {
+      let out = '', err = '';
+      py.onStdout = s => { out += s; log(s.trimEnd()); };
+      py.onStderr = s => { err += s; log(s.trimEnd(), '#f85149'); };
+      await py.run('import json; print(json.dumps({"hello": "world"}))');
+      setResult(idx, out.includes('hello'), out.trim() || err.trim());
+    } catch(e) { setResult(idx, false, e.message); }
+  }
+
+  // Test 6: File I/O
+  {
+    const idx = addTest('open("/home/user/test.txt", "w")');
+    try {
+      let out = '', err = '';
+      py.onStdout = s => { out += s; log(s.trimEnd()); };
+      py.onStderr = s => { err += s; log(s.trimEnd(), '#f85149'); };
+      await py.run(`
+with open('/home/user/test.txt', 'w') as f:
+    f.write('hello file')
+with open('/home/user/test.txt') as f:
+    print(f.read())
+`);
+      setResult(idx, out.includes('hello file'), out.trim() || err.trim());
+    } catch(e) { setResult(idx, false, e.message); }
+  }
+
+  // Test 7: pip install six
+  {
+    const idx = addTest('pip install six');
+    try {
+      let pipOut = '';
+      py.onStderr = s => { pipOut += s; log(s.trimEnd(), '#bc8cff'); };
+      log('\nInstalling six...', '#bc8cff');
+      const result = await py.pip('six');
+      let out = '', err = '';
+      py.onStdout = s => { out += s; log(s.trimEnd()); };
+      py.onStderr = s => { err += s; log(s.trimEnd(), '#f85149'); };
+      await py.run('import six; print(f"six {six.__version__} OK")');
+      setResult(idx, out.includes('OK'), out.trim() || err.trim());
+    } catch(e) { setResult(idx, false, e.message); }
+  }
+
+  // Test 8: pip install attrs
+  {
+    const idx = addTest('pip install attrs');
+    try {
+      py.onStderr = s => log(s.trimEnd(), '#bc8cff');
+      log('\nInstalling attrs...', '#bc8cff');
+      await py.pip('attrs');
+      let out = '', err = '';
+      py.onStdout = s => { out += s; log(s.trimEnd()); };
+      py.onStderr = s => { err += s; log(s.trimEnd(), '#f85149'); };
+      await py.run('import attr; print(f"attr {attr.__version__} OK")');
+      setResult(idx, out.includes('OK'), out.trim() || err.trim());
+    } catch(e) { setResult(idx, false, e.message); }
+  }
+
+  log(`\n${'─'.repeat(40)}`, '#30363d');
+  log(`Results: ${passed} passed, ${failed} failed`, passed === tests.length ? '#3fb950' : '#f85149');
+
+  py.destroy();
+}
+
+run().catch(e => {
+  log('Fatal error: ' + e.message, '#f85149');
+  console.error(e);
+});
+</script>
+</body>
+</html>

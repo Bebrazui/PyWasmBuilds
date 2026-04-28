@@ -35,9 +35,11 @@ function writeVfs(path, content) {
   vfsNodes.get(par)?.children.add(p.slice(p.lastIndexOf('/') + 1));
 }
 
-for (const d of ['/', '/home', '/home/user', '/tmp', '/usr', '/usr/lib',
-  '/usr/local', '/usr/local/lib', '/usr/local/lib/python3.13',
-  '/usr/local/lib/python3.13/site-packages']) mkdir(d);
+// Create empty python313.zip
+const emptyZip = new Uint8Array([0x50,0x4B,0x05,0x06,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0]);
+writeVfs('/usr/lib/python313.zip', emptyZip);
+mkdir('/usr/lib/python3.13/lib-dynload');
+mkdir('/usr/lib/python3.13/site-packages');
 
 // Load stdlib
 console.log('Loading stdlib...');
@@ -73,7 +75,29 @@ if (AdmZip) {
   console.log(`Stdlib: ${count} files extracted`);
 }
 
-writeVfs('/tmp/run.py', 'import sys\nprint("Hello from Python WASM!")\nprint(1+1)\nsys.stdout.flush()\nsys.stderr.flush()\n');
+writeVfs('/tmp/run.py', `
+import sys
+# Check if random.py is accessible
+import os
+path = '/usr/lib/python3.13'
+files = os.listdir(path)
+has_random = 'random.py' in files
+print(f"os.listdir has random.py: {has_random}")
+print(f"Total files in stdlib: {len(files)}")
+# Try direct open
+try:
+    with open('/usr/lib/python3.13/random.py') as f:
+        first_line = f.readline()
+    print(f"Direct open works: {first_line[:50]}")
+except Exception as e:
+    print(f"Direct open failed: {e}")
+# Try import
+try:
+    import random
+    print(f"import random works! {random.randint(1,10)}")
+except Exception as e:
+    print(f"import random failed: {e}")
+`);
 
 // FDs
 const fds = new Map();
@@ -266,23 +290,25 @@ const wasi = {
     if (!desc || desc.node.type !== 'dir') { dv().setUint32(bufusedPtr, 0, true); return ESUCCESS; }
     const enc = new TextEncoder();
     let written = 0;
-    let next = 1n;
     const cookie = Number(_cookie);
     const entries = [...desc.node.children];
     for (let idx = cookie; idx < entries.length; idx++) {
       const name = entries[idx];
       const nameBytes = enc.encode(name);
       const entrySize = 24 + nameBytes.length;
-      if (written + entrySize > bufLen) break;
+      if (written + entrySize > bufLen) {
+        // Signal more data available by returning bufLen
+        dv().setUint32(bufusedPtr, bufLen, true);
+        return ESUCCESS;
+      }
       const base = bufPtr + written;
       const childPath = desc.path === '/' ? '/' + name : desc.path + '/' + name;
       const childNode = vfsNodes.get(norm(childPath));
       const ft = childNode?.type === 'dir' ? 3 : 4;
-      // d_next(u64) d_ino(u64) d_namlen(u32) d_type(u8) [3 pad] name
-      dv().setBigUint64(base, BigInt(idx + 1), true);      // d_next = next cookie
-      dv().setBigUint64(base + 8, BigInt(idx + 1), true);  // d_ino
-      dv().setUint32(base + 16, nameBytes.length, true);   // d_namlen
-      dv().setUint8(base + 20, ft);                        // d_type
+      dv().setBigUint64(base, BigInt(idx + 1), true);
+      dv().setBigUint64(base + 8, BigInt(idx + 1), true);
+      dv().setUint32(base + 16, nameBytes.length, true);
+      dv().setUint8(base + 20, ft);
       m8().set(nameBytes, base + 24);
       written += entrySize;
     }
