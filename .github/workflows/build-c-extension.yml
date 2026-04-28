@@ -72,21 +72,23 @@ jobs:
       - name: Add wasmtime to PATH
         run: echo "$HOME/.wasmtime/bin" >> $GITHUB_PATH
 
+      - name: Set up host Python 3.13
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.13'
+
       - name: Get WASI pyconfig.h
         run: |
           cd /tmp/cpython
-          # Build host Python first (needed by wasi.py)
           ./configure --prefix=/tmp/cpython-host 2>/dev/null
           make -j$(nproc) python 2>/dev/null
 
-          # Run WASI configure to generate wasm32-wasi pyconfig.h
           export WASI_SDK_PATH=/opt/wasi-sdk
           python3 Tools/wasm/wasi.py configure-build-python
           python3 Tools/wasm/wasi.py make-build-python
           git clean -fdx -e Doc/venv -e cross-build
           python3 Tools/wasm/wasi.py configure-host
 
-          # Find the WASI pyconfig.h
           PYCONFIG=$(find /tmp/cpython/cross-build -name "pyconfig.h" | head -1)
           echo "WASI pyconfig.h: $PYCONFIG"
           echo "PYCONFIG_DIR=$(dirname $PYCONFIG)" >> $GITHUB_ENV
