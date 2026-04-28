@@ -66,62 +66,31 @@ jobs:
           echo "pyconfig.h: $PYCONFIG"
           echo "PYCONFIG_DIR=$(dirname $PYCONFIG)" >> $GITHUB_ENV
 
-      - name: Write C extension source
+      - name: Compile C extensions to WASM
         run: |
           mkdir -p /tmp/ext-build
-          python3 -c "
-src = '''
-#define PY_SSIZE_T_CLEAN
-#include \"Python.h\"
 
-static PyObject* test_hello(PyObject* self, PyObject* args) {
-    return PyUnicode_FromString(\"Hello from C-extension WASM!\");
-}
+          for src in c-extensions/*.c; do
+            name=$(basename "$src" .c)
+            echo "Compiling $name..."
+            /opt/wasi-sdk/bin/clang \
+              --target=wasm32-wasi \
+              --sysroot=/opt/wasi-sdk/share/wasi-sysroot \
+              -I/tmp/cpython/Include \
+              -I/tmp/cpython/Include/cpython \
+              -I${{ env.PYCONFIG_DIR }} \
+              -DPy_BUILD_CORE_BUILTIN=1 \
+              -O2 \
+              -shared \
+              -Wl,--no-entry \
+              -Wl,--export=PyInit_${name} \
+              -o /tmp/ext-build/${name}.wasm \
+              "$src" && echo "OK: ${name}.wasm" || echo "FAILED: $name"
+          done
 
-static PyObject* test_add(PyObject* self, PyObject* args) {
-    long a, b;
-    if (!PyArg_ParseTuple(args, \"ll\", &a, &b)) return NULL;
-    return PyLong_FromLong(a + b);
-}
-
-static PyMethodDef TestMethods[] = {
-    {\"hello\", test_hello, METH_NOARGS, \"Return hello string\"},
-    {\"add\",   test_add,   METH_VARARGS, \"Add two numbers\"},
-    {NULL, NULL, 0, NULL}
-};
-
-static struct PyModuleDef testmodule = {
-    PyModuleDef_HEAD_INIT, \"_testcext\", NULL, -1, TestMethods
-};
-
-PyMODINIT_FUNC PyInit__testcext(void) {
-    return PyModule_Create(&testmodule);
-}
-'''
-with open('/tmp/ext-build/testmodule.c', 'w') as f:
-    f.write(src)
-print('Written testmodule.c')
-"
-
-      - name: Compile C extension to WASM
-        run: |
-          /opt/wasi-sdk/bin/clang \
-            --target=wasm32-wasi \
-            --sysroot=/opt/wasi-sdk/share/wasi-sysroot \
-            -I/tmp/cpython/Include \
-            -I/tmp/cpython/Include/cpython \
-            -I${{ env.PYCONFIG_DIR }} \
-            -DPy_BUILD_CORE_BUILTIN=1 \
-            -O2 \
-            -shared \
-            -Wl,--no-entry \
-            -Wl,--export=PyInit__testcext \
-            -o /tmp/ext-build/_testcext.wasm \
-            /tmp/ext-build/testmodule.c
-          echo "Built: $(du -sh /tmp/ext-build/_testcext.wasm)"
           ls -lh /tmp/ext-build/
 
-      - name: Upload extension artifact
+      - name: Upload extension artifacts
         uses: actions/upload-artifact@v4
         with:
           name: c-extensions-wasm
@@ -132,6 +101,6 @@ print('Written testmodule.c')
         uses: softprops/action-gh-release@v2
         with:
           tag_name: "cpython-wasm-v3.13.0"
-          files: /tmp/ext-build/_testcext.wasm
+          files: /tmp/ext-build/*.wasm
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
