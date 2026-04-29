@@ -57,9 +57,9 @@ function setResult(idx, ok, msg) {
 
 async function run() {
   const py = new PythonRuntime({
-    wasmUrl: '../editor/python.wasm',
-    stdlibUrl: '../editor/python313-stdlib.zip',
-    workerUrl: '../packages/cpython-wasm/dist/worker.js',
+    wasmUrl: '/editor/python.wasm',
+    stdlibUrl: '/editor/python313-stdlib.zip',
+    workerUrl: '/packages/cpython-wasm/dist/worker.js',
   });
 
   py.onStdout = (s) => log(s.trimEnd(), '#e6edf3');

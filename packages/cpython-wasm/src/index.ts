@@ -54,7 +54,19 @@ export class PythonRuntime {
    * Must be called before run().
    */
   async init(): Promise<void> {
-    const workerUrl = this.opts.workerUrl ?? new URL('./worker.js', import.meta.url).href;
+    let workerUrl: string;
+
+    if (this.opts.workerUrl) {
+      workerUrl = this.opts.workerUrl;
+    } else {
+      // Try to resolve worker.js relative to this module
+      // Falls back to CDN if import.meta.url is not available
+      try {
+        workerUrl = new URL('./worker.js', import.meta.url).href;
+      } catch {
+        workerUrl = 'https://cdn.jsdelivr.net/npm/cpython-wasm@0.2.0/dist/worker.js';
+      }
+    }
 
     this.worker = new Worker(workerUrl, { type: 'module' });
 

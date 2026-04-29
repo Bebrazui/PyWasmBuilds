@@ -22,9 +22,11 @@ createServer((req, res) => {
   let url = req.url.split('?')[0];
   if (url === '/') url = '/index.html';
 
-  // Serve test-lib and packages from root, everything else from editor/
+  // Serve test-lib and packages from root, editor files from editor/, everything else from editor/
   let file;
   if (url.startsWith('/test-lib/') || url.startsWith('/packages/')) {
+    file = join(ROOT, url);
+  } else if (url.startsWith('/editor/')) {
     file = join(ROOT, url);
   } else {
     file = join(__dir, url);

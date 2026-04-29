@@ -52,7 +52,21 @@ for (const d of ['/', '/home', '/home/user', '/tmp', '/usr', '/usr/lib',
   '/usr/lib/python3.13', '/usr/lib/python3.13/lib-dynload',
   '/usr/lib/python3.13/site-packages',
   '/usr/local', '/usr/local/lib', '/usr/local/lib/python3.13',
-  '/usr/local/lib/python3.13/site-packages']) mkdir(d);
+  '/usr/local/lib/python3.13/site-packages',
+  // Linux-like system directories
+  '/etc', '/var', '/var/tmp', '/proc', '/dev',
+  '/bin', '/usr/bin', '/usr/local/bin',
+  '/root', '/opt',
+]) mkdir(d);
+
+// Populate /etc with minimal Linux-like files
+writeFile('/etc/hostname', 'python-wasm\n');
+writeFile('/etc/os-release', 'NAME="Python WASM"\nID=python-wasm\nVERSION="3.13"\n');
+writeFile('/etc/passwd', 'root:x:0:0:root:/root:/bin/sh\nuser:x:1000:1000:user:/home/user:/bin/sh\n');
+writeFile('/etc/group', 'root:x:0:\nuser:x:1000:\n');
+writeFile('/etc/timezone', 'UTC\n');
+writeFile('/proc/version', 'Linux version 5.15.0 (Python WASM Runtime)\n');
+writeFile('/dev/null', '');
 
 // ── FDs ───────────────────────────────────────────────────────────────────────
 

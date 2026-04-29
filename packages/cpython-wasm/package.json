@@ -1,6 +1,6 @@
 {
   "name": "cpython-wasm",
-  "version": "0.1.0",
+  "version": "0.3.0",
   "description": "CPython 3.13 compiled to WebAssembly (wasm32-wasi) — run Python in the browser",
   "type": "module",
   "main": "./dist/index.js",
