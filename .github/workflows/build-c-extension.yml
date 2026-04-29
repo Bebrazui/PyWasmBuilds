@@ -106,6 +106,8 @@ jobs:
           for src in c-extensions/*.c; do
             name=$(basename "$src" .c)
             echo "=== Compiling $name ==="
+
+            # Compile to object file — no PIC, use CPython's memory directly
             /opt/wasi-sdk/bin/clang \
               --target=wasm32-wasi \
               --sysroot=/opt/wasi-sdk/share/wasi-sysroot \
@@ -113,18 +115,17 @@ jobs:
               -I/tmp/cpython/Include/cpython \
               -I${{ env.PYCONFIG_DIR }} \
               -DPy_BUILD_CORE_BUILTIN=1 \
-              -fPIC \
               -O2 \
               -c \
               -o /tmp/ext-build/${name}.o \
               "$src"
 
+            # Link as WASM module — import Python C API functions, export PyInit_*
             /opt/wasi-sdk/bin/wasm-ld \
               --no-entry \
-              --export-dynamic \
-              --import-undefined \
-              --experimental-pic \
-              -shared \
+              --allow-undefined \
+              --export=PyInit_${name} \
+              --import-memory \
               -o /tmp/ext-build/${name}.wasm \
               /tmp/ext-build/${name}.o
 
