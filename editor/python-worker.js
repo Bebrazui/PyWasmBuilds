@@ -278,41 +278,41 @@ function buildWasi(getMem, args, envVars, onStdout, onStderr, checkInt) {
             const parts = cmd.slice('CALL:'.length).split(':');
             const moduleName = parts[0];
             const funcName = parts[1];
-            const argsJson = parts.slice(2).join(':'); // re-join in case json has colons
+            const argsJson = parts.slice(2).join(':');
             const entry = pendingCExtInits.get(moduleName);
             if (entry) {
               try {
-                const args = JSON.parse(argsJson || '[]');
+                const callArgs = JSON.parse(argsJson || '[]');
                 const extExports = entry.extInst.exports;
-                // Call the wasm_{funcName} export directly (raw C types, no Python C API)
                 const wasmFn = extExports[`wasm_${funcName}`];
+                if (typeof wasmFn !== 'function') {
+                  throw new Error(`wasm_${funcName} not exported by ${moduleName}.wasm`);
+                }
+                const result = wasmFn(...callArgs);
+                // Determine return type: if result is a number and the C function
+                // returns const char*, read it as a null-terminated string from
+                // the shared CPython memory (extension uses --import-memory).
                 let jsResult;
-                if (typeof wasmFn === 'function') {
-                  const result = wasmFn(...args);
-                  if (typeof result === 'number' && funcName === 'hello') {
-                    // char* pointer — read null-terminated string from shared WASM memory
-                    const mem = getMem();
+                if (typeof result === 'number') {
+                  // Heuristic: if result looks like a pointer (> 0 and < memory size),
+                  // try to read it as a C string. Otherwise treat as integer.
+                  const mem = getMem();
+                  if (result > 0 && result < mem.buffer.byteLength) {
                     const bytes = new Uint8Array(mem.buffer, result);
                     let end = 0;
-                    while (bytes[end] !== 0 && end < 1024) end++;
-                    jsResult = new TextDecoder().decode(bytes.subarray(0, end));
+                    // Read until null terminator or 4096 bytes max
+                    while (end < 4096 && bytes[end] !== 0) end++;
+                    if (end > 0 && end < 4096) {
+                      // Looks like a valid C string
+                      jsResult = new TextDecoder().decode(bytes.subarray(0, end));
+                    } else {
+                      jsResult = result; // plain integer
+                    }
                   } else {
                     jsResult = result;
                   }
                 } else {
-                  // Fallback for testmodule without wasm_* exports:
-                  // implement the known functions directly in JS
-                  if (moduleName === 'testmodule') {
-                    if (funcName === 'hello') {
-                      jsResult = 'Hello from C-extension WASM!';
-                    } else if (funcName === 'add') {
-                      jsResult = args[0] + args[1];
-                    } else {
-                      throw new Error(`Unknown function: ${funcName}. Rebuild testmodule.wasm with wasm_* exports.`);
-                    }
-                  } else {
-                    throw new Error(`wasm_${funcName} not exported by ${moduleName}.wasm — rebuild with --export=wasm_${funcName}`);
-                  }
+                  jsResult = result;
                 }
                 response = `OK:${JSON.stringify(jsResult)}\n`;
               } catch (e) {
@@ -1044,16 +1044,11 @@ function generatePythonModuleCode(moduleName, extInst) {
     .filter(name => name.startsWith('wasm_') && typeof extInst.exports[name] === 'function')
     .map(name => name.slice('wasm_'.length));
 
-  // Fallback: if no wasm_* exports, use known API for testmodule
-  // (until testmodule.wasm is rebuilt with wasm_hello/wasm_add exports)
-  const effectiveFuncs = wasmFuncs.length > 0 ? wasmFuncs :
-    (moduleName === 'testmodule' ? ['hello', 'add'] : []);
-
-  if (effectiveFuncs.length === 0) {
-    console.warn(`[cext] No wasm_* exports found in ${moduleName} — module will be empty stub`);
-  } else if (wasmFuncs.length === 0) {
-    console.log(`[cext] ${moduleName}: using fallback function list (rebuild WASM to export wasm_* functions)`);
+  if (wasmFuncs.length === 0) {
+    console.warn(`[cext] No wasm_* exports found in ${moduleName} — module will be empty stub. Rebuild with --export=wasm_{funcName}`);
   }
+
+  const effectiveFuncs = wasmFuncs;
 
   const funcDefs = effectiveFuncs.map(fn => `
 def ${fn}(*args):
