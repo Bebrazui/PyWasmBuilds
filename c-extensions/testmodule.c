@@ -24,3 +24,19 @@ static struct PyModuleDef testmodule = {
 PyMODINIT_FUNC PyInit_testmodule(void) {
     return PyModule_Create(&testmodule);
 }
+
+/* ── Public C exports for direct WASM calling ────────────────────────────────
+ * These wrappers allow JS to call the functions directly without going through
+ * the Python C API method dispatch. They operate on raw C types, not PyObjects.
+ * Exported via --export=wasm_hello --export=wasm_add in wasm-ld.
+ */
+
+__attribute__((visibility("default")))
+const char* wasm_hello(void) {
+    return "Hello from C-extension WASM!";
+}
+
+__attribute__((visibility("default")))
+long wasm_add(long a, long b) {
+    return a + b;
+}

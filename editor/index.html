@@ -108,8 +108,10 @@
     <button class="ex" onclick="loadEx('fib')">Fibonacci</button>
     <button class="ex" onclick="loadEx('files')">Files</button>
     <button class="ex" onclick="loadEx('stdlib')">Stdlib</button>
+    <button class="ex" onclick="loadEx('cext')">C-ext</button>
   </div>
   <button class="btn btn-clear" onclick="clearOut()">Clear</button>
+  <button class="btn" id="cext-btn" onclick="loadCExt()" title="Load testmodule.wasm C-extension" disabled>🔌 Load C-ext</button>
   <button class="btn btn-run" id="run-btn" onclick="runCode()" disabled>▶ Run</button>
 </header>
 
@@ -131,6 +133,7 @@ print(f"Sum of squares 0-9: {result}")
     <div class="tabs">
       <div class="tab active" onclick="switchTab('console')">💻 Console</div>
       <div class="tab" onclick="switchTab('pip')">📦 pip</div>
+      <div class="tab" onclick="switchTab('files'); refreshFiles()">📁 Files</div>
     </div>
 
     <div class="tab-panel active" id="tab-console">
@@ -147,6 +150,16 @@ print(f"Sum of squares 0-9: {result}")
         <div id="pip-installed" class="pip-installed"></div>
       </div>
     </div>
+
+    <div class="tab-panel" id="tab-files">
+      <div id="files-panel" style="padding:10px;display:flex;flex-direction:column;gap:6px;overflow:auto;">
+        <div style="display:flex;align-items:center;gap:6px;flex-shrink:0;">
+          <span style="font-size:11px;color:var(--text-dim);">/home/user/ — persisted via OPFS</span>
+          <button class="btn" style="margin-left:auto;font-size:11px;padding:3px 8px;" onclick="refreshFiles()">↻ Refresh</button>
+        </div>
+        <div id="files-list" style="font-family:var(--font-mono);font-size:12px;"></div>
+      </div>
+    </div>
   </div>
 
   <div class="statusbar">
@@ -161,13 +174,15 @@ const EXAMPLES = {
   fib: `def fib(n):\n    a, b = 0, 1\n    for _ in range(n):\n        yield a\n        a, b = b, a+b\n\nprint(list(fib(15)))\n`,
   files: `import os\n\nwith open('/home/user/test.txt', 'w') as f:\n    f.write("Hello from Python WASM!\\n")\n\nwith open('/home/user/test.txt') as f:\n    print(f.read())\n\nprint("Files:", os.listdir('/home/user'))\n`,
   stdlib: `import math, random, json, re, datetime\n\nprint("math.pi:", math.pi)\nprint("random:", random.randint(1, 100))\nprint("json:", json.dumps({"hello": "world"}))\nprint("regex:", re.findall(r'\\w+', 'hello world'))\nprint("date:", datetime.date.today())\n`,
+  cext: `# C-extension test — testmodule.wasm must be loaded first\n# Click "Load testmodule.wasm" button, then run this code\nimport testmodule\nprint("hello():", testmodule.hello())\nprint("add(3, 4):", testmodule.add(3, 4))\nprint("SUCCESS: C-extension works!")\n`,
 };
 
 function loadEx(name) { document.getElementById('editor').value = EXAMPLES[name] || ''; }
 
 // ── Tabs ──────────────────────────────────────────────────────────────────────
 function switchTab(name) {
-  document.querySelectorAll('.tab').forEach((t, i) => t.classList.toggle('active', ['console','pip'][i] === name));
+  const tabNames = ['console', 'pip', 'files'];
+  document.querySelectorAll('.tab').forEach((t, i) => t.classList.toggle('active', tabNames[i] === name));
   document.querySelectorAll('.tab-panel').forEach(p => p.classList.remove('active'));
   document.getElementById('tab-' + name).classList.add('active');
 }
@@ -208,6 +223,7 @@ worker.onmessage = (e) => {
     document.getElementById('overlay').classList.add('hidden');
     document.getElementById('run-btn').disabled = false;
     document.getElementById('pip-btn').disabled = false;
+    document.getElementById('cext-btn').disabled = false;
     setStatus('Python 3.13 WASM ready', 'ready');
     out('Custom Python WASM runtime ready ✓\n', 'out-ok');
     out('─'.repeat(50) + '\n', 'out-info');
@@ -221,6 +237,9 @@ worker.onmessage = (e) => {
     const p = pending.get(msg.id);
     if (p) { p.resolve(msg.value); pending.delete(msg.id); }
   } else if (msg.type === 'pip.result') {
+    const p = pending.get(msg.id);
+    if (p) { p.resolve(msg.value); pending.delete(msg.id); }
+  } else if (msg.type === 'fs.result') {
     const p = pending.get(msg.id);
     if (p) { p.resolve(msg.value); pending.delete(msg.id); }
   } else if (msg.type === 'error') {
@@ -240,6 +259,88 @@ function send(msg) {
     pending.set(id, { resolve, reject });
     worker.postMessage({ ...msg, id });
   });
+}
+
+// ── C-extension loader ────────────────────────────────────────────────────────
+let cextLoaded = false;
+
+async function loadCExt() {
+  const btn = document.getElementById('cext-btn');
+  btn.disabled = true;
+  btn.textContent = '🔌 Loading...';
+  out('Loading testmodule.wasm...\n', 'out-info');
+
+  try {
+    const resp = await fetch('./testmodule.wasm');
+    if (!resp.ok) throw new Error(`HTTP ${resp.status}: testmodule.wasm not found`);
+    const wasmBytes = new Uint8Array(await resp.arrayBuffer());
+
+    const result = await send({
+      type: 'cext.register',
+      moduleName: 'testmodule',
+      wasmBytes,
+    });
+
+    cextLoaded = true;
+    btn.textContent = '✓ testmodule';
+    btn.style.color = 'var(--green)';
+    btn.style.borderColor = 'var(--green)';
+    out(`testmodule.wasm registered (${wasmBytes.length} bytes)\n`, 'out-ok');
+    out('Run the "C-ext" example to test it.\n', 'out-info');
+  } catch (err) {
+    btn.disabled = false;
+    btn.textContent = '🔌 Load C-ext';
+    out(`Failed to load C-extension: ${err.message}\n`, 'out-err');
+  }
+}
+
+// ── File Manager ──────────────────────────────────────────────────────────────
+async function refreshFiles() {
+  const list = document.getElementById('files-list');
+  list.innerHTML = '<span style="color:var(--text-dim)">Loading...</span>';
+  try {
+    const files = await send({ type: 'fs.list' });
+    if (!files || files.length === 0) {
+      list.innerHTML = '<span style="color:var(--text-dim);font-size:11px;">No files yet. Write to /home/user/ from Python to create files.</span>';
+      return;
+    }
+    list.innerHTML = '';
+    for (const f of files.sort((a, b) => a.path.localeCompare(b.path))) {
+      const name = f.path.replace('/home/user/', '');
+      const size = f.size < 1024 ? f.size + ' B' : (f.size / 1024).toFixed(1) + ' KB';
+      const row = document.createElement('div');
+      row.style.cssText = 'display:flex;align-items:center;gap:8px;padding:4px 0;border-bottom:1px solid var(--border)';
+      row.innerHTML = `
+        <span style="flex:1;color:var(--text)">${name}</span>
+        <span style="color:var(--text-dim);font-size:10px">${size}</span>
+        <button class="btn" style="font-size:10px;padding:2px 6px" onclick="downloadFile('${f.path}','${name}')">⬇</button>
+        <button class="btn" style="font-size:10px;padding:2px 6px;color:var(--red)" onclick="deleteFile('${f.path}')">✕</button>
+      `;
+      list.appendChild(row);
+    }
+  } catch (e) {
+    list.innerHTML = `<span style="color:var(--red)">${e.message}</span>`;
+  }
+}
+
+async function downloadFile(vfsPath, filename) {
+  try {
+    const bytes = await send({ type: 'fs.read', path: vfsPath });
+    if (!bytes) { alert('File not found'); return; }
+    const blob = new Blob([bytes]);
+    const url = URL.createObjectURL(blob);
+    const a = document.createElement('a');
+    a.href = url; a.download = filename; a.click();
+    URL.revokeObjectURL(url);
+  } catch (e) { alert('Download failed: ' + e.message); }
+}
+
+async function deleteFile(vfsPath) {
+  if (!confirm(`Delete ${vfsPath}?`)) return;
+  try {
+    await send({ type: 'fs.delete', path: vfsPath });
+    refreshFiles();
+  } catch (e) { alert('Delete failed: ' + e.message); }
 }
 
 // ── Run ───────────────────────────────────────────────────────────────────────

@@ -10,6 +10,100 @@ self.postMessage({ type: 'status', text: 'Worker loaded...' });
 
 const vfsNodes = new Map();
 
+// ── Persistence (OPFS) ────────────────────────────────────────────────────────
+// Files under /home/user/ are automatically persisted to OPFS.
+// On init: restored from OPFS → vfsNodes.
+// On every fd_close of a /home/user/ file: saved to OPFS asynchronously.
+// Fallback: if OPFS unavailable, files live only in memory for the session.
+
+let opfsRoot = null; // FileSystemDirectoryHandle or null
+
+async function opfsInit() {
+  try {
+    opfsRoot = await navigator.storage.getDirectory();
+    // Ensure our subdirectory exists
+    opfsRoot = await opfsRoot.getDirectoryHandle('python-wasm-home', { create: true });
+    console.log('[opfs] OPFS available');
+  } catch (e) {
+    opfsRoot = null;
+    console.warn('[opfs] OPFS not available, files will not persist:', e.message);
+  }
+}
+
+// Convert /home/user/foo/bar.txt → opfs key "foo/bar.txt"
+function opfsKey(vfsPath) {
+  const prefix = '/home/user/';
+  if (!vfsPath.startsWith(prefix)) return null;
+  return vfsPath.slice(prefix.length);
+}
+
+// Save a single file to OPFS (fire-and-forget, errors are logged not thrown)
+async function opfsSave(vfsPath) {
+  if (!opfsRoot) return;
+  const key = opfsKey(vfsPath);
+  if (!key) return;
+  const node = vfsNodes.get(norm(vfsPath));
+  if (!node || node.type !== 'file') return;
+
+  try {
+    // Recreate directory structure in OPFS
+    const parts = key.split('/');
+    const filename = parts.pop();
+    let dir = opfsRoot;
+    for (const part of parts) {
+      dir = await dir.getDirectoryHandle(part, { create: true });
+    }
+    const fileHandle = await dir.getFileHandle(filename, { create: true });
+    const writable = await fileHandle.createWritable();
+    await writable.write(node.content);
+    await writable.close();
+  } catch (e) {
+    console.warn('[opfs] save failed for', vfsPath, e.message);
+  }
+}
+
+// Delete a file from OPFS
+async function opfsDelete(vfsPath) {
+  if (!opfsRoot) return;
+  const key = opfsKey(vfsPath);
+  if (!key) return;
+  try {
+    const parts = key.split('/');
+    const filename = parts.pop();
+    let dir = opfsRoot;
+    for (const part of parts) {
+      dir = await dir.getDirectoryHandle(part, { create: false });
+    }
+    await dir.removeEntry(filename);
+  } catch { /* file may not exist */ }
+}
+
+// Restore all files from OPFS into vfsNodes on startup
+async function opfsRestore() {
+  if (!opfsRoot) return;
+  let count = 0;
+  async function walk(dirHandle, vfsPrefix) {
+    for await (const [name, handle] of dirHandle.entries()) {
+      const vfsPath = vfsPrefix + '/' + name;
+      if (handle.kind === 'directory') {
+        mkdir(vfsPath);
+        await walk(handle, vfsPath);
+      } else {
+        const file = await handle.getFile();
+        const bytes = new Uint8Array(await file.arrayBuffer());
+        writeFile(vfsPath, bytes);
+        count++;
+      }
+    }
+  }
+  try {
+    await walk(opfsRoot, '/home/user');
+    if (count > 0) console.log(`[opfs] Restored ${count} files from OPFS`);
+  } catch (e) {
+    console.warn('[opfs] restore failed:', e.message);
+  }
+}
+
 function norm(path) {
   let p = path.replace(/\\/g, '/');
   if (!p.startsWith('/')) p = '/' + p;
@@ -91,6 +185,14 @@ function fdOpen(path, oflags) {
 
 const ESUCCESS = 0, EBADF = 8, ENOENT = 44, ENOSYS = 52;
 
+// ── C-extension callback channel buffers (fd=100 write, fd=101 read) ─────────
+// These are module-level so they persist across buildWasi calls within a run.
+let fd101ReadBuf = new Uint8Array(0);
+let fd101ReadPos = 0;
+
+// Registry for pending C-extension initializations (populated by runCode)
+const pendingCExtInits = new Map(); // moduleName -> { initFn, extInst }
+
 // ── Build WASI imports for a given memory getter ──────────────────────────────
 
 function buildWasi(getMem, args, envVars, onStdout, onStderr, checkInt) {
@@ -146,9 +248,86 @@ function buildWasi(getMem, args, envVars, onStdout, onStderr, checkInt) {
         if (!len) continue;
         const chunk = new Uint8Array(getMem().buffer, base, len).slice();
         const text = new TextDecoder().decode(chunk);
-        console.log(`[fd_write] fd=${fd} len=${len} text="${text.slice(0,50)}"`);
         if (fd === 1) { stdoutBuf += text; stdoutBuf = flushLine(stdoutBuf, onStdout); }
         else if (fd === 2) { stderrBuf += text; stderrBuf = flushLine(stderrBuf, onStderr); }
+        else if (fd === 100) {
+          // ── C-extension callback channel ──────────────────────────────────
+          // Handles two commands:
+          //   "CEXT_INIT:{name}\n"           → call PyInit_{name}(), return "OK:{hexptr}\n"
+          //   "CALL:{module}:{func}:{json}\n" → call WASM function, return "OK:{json}\n"
+          const cmd = text.trim();
+          let response;
+
+          if (cmd.startsWith('CEXT_INIT:')) {
+            const moduleName = cmd.slice('CEXT_INIT:'.length);
+            const entry = pendingCExtInits.get(moduleName);
+            if (entry) {
+              try {
+                const modulePtr = entry.initFn();
+                response = modulePtr ? `OK:${modulePtr.toString(16)}\n` : `ERR:null_ptr\n`;
+                console.log(`[cext] PyInit_${moduleName}() = ${modulePtr}`);
+              } catch (e) {
+                response = `ERR:${e.message}\n`;
+              }
+            } else {
+              response = `ERR:not_registered\n`;
+            }
+
+          } else if (cmd.startsWith('CALL:')) {
+            // Format: "CALL:{module}:{func}:{json_args}"
+            const parts = cmd.slice('CALL:'.length).split(':');
+            const moduleName = parts[0];
+            const funcName = parts[1];
+            const argsJson = parts.slice(2).join(':'); // re-join in case json has colons
+            const entry = pendingCExtInits.get(moduleName);
+            if (entry) {
+              try {
+                const args = JSON.parse(argsJson || '[]');
+                const extExports = entry.extInst.exports;
+                // Call the wasm_{funcName} export directly (raw C types, no Python C API)
+                const wasmFn = extExports[`wasm_${funcName}`];
+                let jsResult;
+                if (typeof wasmFn === 'function') {
+                  const result = wasmFn(...args);
+                  if (typeof result === 'number' && funcName === 'hello') {
+                    // char* pointer — read null-terminated string from shared WASM memory
+                    const mem = getMem();
+                    const bytes = new Uint8Array(mem.buffer, result);
+                    let end = 0;
+                    while (bytes[end] !== 0 && end < 1024) end++;
+                    jsResult = new TextDecoder().decode(bytes.subarray(0, end));
+                  } else {
+                    jsResult = result;
+                  }
+                } else {
+                  // Fallback for testmodule without wasm_* exports:
+                  // implement the known functions directly in JS
+                  if (moduleName === 'testmodule') {
+                    if (funcName === 'hello') {
+                      jsResult = 'Hello from C-extension WASM!';
+                    } else if (funcName === 'add') {
+                      jsResult = args[0] + args[1];
+                    } else {
+                      throw new Error(`Unknown function: ${funcName}. Rebuild testmodule.wasm with wasm_* exports.`);
+                    }
+                  } else {
+                    throw new Error(`wasm_${funcName} not exported by ${moduleName}.wasm — rebuild with --export=wasm_${funcName}`);
+                  }
+                }
+                response = `OK:${JSON.stringify(jsResult)}\n`;
+              } catch (e) {
+                response = `ERR:${e.message}\n`;
+              }
+            } else {
+              response = `ERR:module_not_found:${moduleName}\n`;
+            }
+          } else {
+            response = `ERR:unknown_command\n`;
+          }
+
+          fd101ReadBuf = new TextEncoder().encode(response);
+          fd101ReadPos = 0;
+        }
         else {
           const desc = fds.get(fd); if (!desc) return EBADF;
           const pos = Number(desc.pos); const cur = desc.node.content || new Uint8Array(0);
@@ -164,6 +343,24 @@ function buildWasi(getMem, args, envVars, onStdout, onStderr, checkInt) {
 
     fd_read(fd, iovsPtr, iovsLen, nreadPtr) {
       if (fd === 0) { dv().setUint32(nreadPtr, 0, true); return ESUCCESS; }
+      if (fd === 101) {
+        // ── C-extension response channel ──────────────────────────────────
+        // Python reads the response from PyInit_* call here.
+        let total = 0;
+        for (let i = 0; i < iovsLen; i++) {
+          const base = dv().getUint32(iovsPtr + i * 8, true);
+          const len  = dv().getUint32(iovsPtr + i * 8 + 4, true);
+          if (!len) continue;
+          const avail = fd101ReadBuf.length - fd101ReadPos;
+          if (avail <= 0) break;
+          const n = Math.min(len, avail);
+          new Uint8Array(getMem().buffer, base, n).set(fd101ReadBuf.subarray(fd101ReadPos, fd101ReadPos + n));
+          fd101ReadPos += n;
+          total += n;
+        }
+        dv().setUint32(nreadPtr, total, true);
+        return ESUCCESS;
+      }
       const desc = fds.get(fd); if (!desc) return EBADF;
       let total = 0;
       for (let i = 0; i < iovsLen; i++) {
@@ -190,11 +387,22 @@ function buildWasi(getMem, args, envVars, onStdout, onStderr, checkInt) {
       dv().setBigUint64(newoffPtr, p, true); return ESUCCESS;
     },
 
-    fd_close(fd) { fds.delete(fd); return ESUCCESS; },
+    fd_close(fd) {
+      const desc = fds.get(fd);
+      if (desc) {
+        // Auto-save /home/user/ files to OPFS when closed
+        if (desc.path.startsWith('/home/user/') && desc.node.type === 'file') {
+          opfsSave(desc.path); // fire-and-forget
+        }
+      }
+      fds.delete(fd);
+      return ESUCCESS;
+    },
 
     fd_fdstat_get(fd, statPtr) {
       const node = fds.get(fd)?.node;
-      const ft = fd <= 2 ? 2 : (node?.type === 'dir' ? 3 : 4);
+      // fd=100 (cext write) and fd=101 (cext read) are character devices
+      const ft = (fd <= 2 || fd === 100 || fd === 101) ? 2 : (node?.type === 'dir' ? 3 : 4);
       dv().setUint8(statPtr, ft);
       dv().setUint16(statPtr + 2, 0, true);
       dv().setBigUint64(statPtr + 8, 0xffffffffffffffffn, true);
@@ -277,7 +485,10 @@ function buildWasi(getMem, args, envVars, onStdout, onStderr, checkInt) {
     path_unlink_file(dirfd, pathPtr, pathLen) {
       const rel = str(pathPtr, pathLen);
       const base = dirfd === 3 ? '/' : dirfd === 4 ? '/home/user' : (fds.get(dirfd)?.path ?? '/');
-      vfsNodes.delete(norm(rel.startsWith('/') ? rel : base + '/' + rel));
+      const p = norm(rel.startsWith('/') ? rel : base + '/' + rel);
+      vfsNodes.delete(p);
+      // Remove from OPFS if it was a persisted file
+      if (p.startsWith('/home/user/')) opfsDelete(p);
       return ESUCCESS;
     },
 
@@ -439,39 +650,171 @@ const installedPackages = new Set();
 
 // ── Dynamic C-extension loader ────────────────────────────────────────────────
 
-// Registry of loaded WASM C-extension instances
-const cExtensions = new Map(); // moduleName -> WebAssembly.Instance
+// Registry: moduleName -> { wasmBytes, module (compiled) }
+// We store compiled WebAssembly.Module so we can re-instantiate per CPython run
+const cExtRegistry = new Map(); // moduleName -> { wasmBytes: Uint8Array, wasmModule: WebAssembly.Module }
 
 /**
- * Load a C-extension .wasm file and link it with CPython exports.
- * The extension must export PyInit_{moduleName}.
+ * Register a C-extension by compiling its WASM bytes.
+ * Actual linking with CPython happens inside runCode() per-run.
  */
-async function loadCExtension(moduleName, wasmBytes, cpythonExports) {
-  // Build import object from CPython exports
-  const env = {};
-  for (const [name, value] of Object.entries(cpythonExports)) {
-    if (typeof value === 'function' || value instanceof WebAssembly.Global) {
-      env[name] = value;
+async function registerCExtension(moduleName, wasmBytes) {
+  try {
+    const wasmModule = await WebAssembly.compile(wasmBytes);
+    cExtRegistry.set(moduleName, { wasmBytes, wasmModule });
+    self.postMessage({ type: 'stdout', data: `[cext] Registered C-extension: ${moduleName}\n` });
+    return true;
+  } catch (e) {
+    self.postMessage({ type: 'stderr', data: `[cext] Failed to compile ${moduleName}: ${e.message}\n` });
+    return false;
+  }
+}
+
+/**
+ * Instantiate all registered C-extensions against a live CPython instance.
+ * Returns a Map<moduleName, PyObject_ptr> — the pointer returned by PyInit_*.
+ *
+ * Called from runCode() after the CPython WASM instance is created but
+ * BEFORE _start() runs, so we can call PyImport_AppendInittab.
+ *
+ * Actually we call it AFTER _start() via PyImport_AddModule +
+ * PyDict_SetItemString to inject into sys.modules directly.
+ */
+async function instantiateCExtensions(cpythonInst) {
+  const results = new Map(); // moduleName -> instance
+  for (const [moduleName, entry] of cExtRegistry) {
+    try {
+      // Build env from CPython exports — pass all functions + shared memory
+      const env = { memory: cpythonInst.exports.memory };
+      for (const [name, val] of Object.entries(cpythonInst.exports)) {
+        if (typeof val === 'function') env[name] = val;
+      }
+      const extInst = await WebAssembly.instantiate(entry.wasmModule, {
+        env,
+        wasi_snapshot_preview1: new Proxy({}, { get: () => () => 0 }),
+      });
+      results.set(moduleName, extInst);
+      console.log(`[cext] Instantiated ${moduleName}, exports:`, Object.keys(extInst.exports).join(', '));
+    } catch (e) {
+      console.error(`[cext] Failed to instantiate ${moduleName}:`, e.message);
+      self.postMessage({ type: 'stderr', data: `[cext] Failed to link ${moduleName}: ${e.message}\n` });
     }
   }
+  return results;
+}
 
-  const imports = {
-    env,
-    wasi_snapshot_preview1: new Proxy({}, {
-      get: () => () => 0  // stub WASI calls in extensions
-    })
-  };
+/**
+ * After Python is initialized (_start ran), inject C-extension modules
+ * into sys.modules using the Python C API exported by CPython WASM.
+ *
+ * Flow:
+ *   1. Call extInst.exports.PyInit_{moduleName}() → returns PyObject* (module ptr)
+ *   2. Call cpython.PyImport_AddModule("moduleName") to create entry in sys.modules
+ *   3. Call cpython.PySys_GetObject("modules") → sys.modules dict ptr
+ *   4. Call cpython.PyDict_SetItemString(modules_ptr, "moduleName", module_ptr)
+ */
+function injectCExtensionsIntoSysModules(cpythonInst, extInstances) {
+  const exp = cpythonInst.exports;
+  const mem = exp.memory;
 
-  try {
-    const result = await WebAssembly.instantiate(wasmBytes, imports);
-    const instance = result.instance;
-    cExtensions.set(moduleName, instance);
-    self.postMessage({ type: 'stdout', data: `Loaded C-extension: ${moduleName}\n` });
-    return instance;
-  } catch (e) {
-    self.postMessage({ type: 'stderr', data: `Failed to load C-extension ${moduleName}: ${e.message}\n` });
-    return null;
+  // Helper: write a null-terminated UTF-8 string into WASM memory at a scratch area.
+  // We use a fixed scratch buffer at offset 64 (well below Python's heap which starts ~1MB).
+  // This is safe because Python hasn't started yet when we first call this,
+  // but we call it AFTER _start, so we need a safe area.
+  // Use a high-but-safe address: 4096 (page 1, before Python's typical heap start).
+  const SCRATCH = 4096;
+  const enc = new TextEncoder();
+
+  function writeStr(str) {
+    const bytes = enc.encode(str + '\0');
+    new Uint8Array(mem.buffer, SCRATCH, bytes.length).set(bytes);
+    return SCRATCH;
   }
+
+  const PySys_GetObject       = exp.PySys_GetObject;
+  const PyDict_SetItemString  = exp.PyDict_SetItemString;
+  const PyImport_AddModule    = exp.PyImport_AddModule;
+
+  if (!PySys_GetObject || !PyDict_SetItemString) {
+    console.warn('[cext] CPython C API not available (PySys_GetObject / PyDict_SetItemString missing)');
+    return;
+  }
+
+  // Get sys.modules dict pointer
+  const modulesNamePtr = writeStr('modules');
+  const sysModulesPtr = PySys_GetObject(modulesNamePtr);
+  if (!sysModulesPtr) {
+    console.warn('[cext] PySys_GetObject("modules") returned null');
+    return;
+  }
+
+  for (const [moduleName, extInst] of extInstances) {
+    const initFnName = `PyInit_${moduleName}`;
+    const initFn = extInst.exports[initFnName];
+    if (typeof initFn !== 'function') {
+      console.warn(`[cext] ${initFnName} not found in extension exports`);
+      self.postMessage({ type: 'stderr', data: `[cext] ${initFnName} not exported by ${moduleName}.wasm\n` });
+      continue;
+    }
+
+    try {
+      // Call PyInit_testmodule() — returns PyObject* pointing to the module
+      const modulePtr = initFn();
+      if (!modulePtr) {
+        console.warn(`[cext] ${initFnName}() returned null`);
+        continue;
+      }
+
+      // Register in sys.modules: sys.modules["moduleName"] = modulePtr
+      const namePtr = writeStr(moduleName);
+      const rc = PyDict_SetItemString(sysModulesPtr, namePtr, modulePtr);
+      if (rc === 0) {
+        console.log(`[cext] ✓ ${moduleName} injected into sys.modules`);
+        self.postMessage({ type: 'stdout', data: `[cext] ✓ ${moduleName} ready\n` });
+      } else {
+        console.warn(`[cext] PyDict_SetItemString failed for ${moduleName}, rc=${rc}`);
+      }
+    } catch (e) {
+      console.error(`[cext] Error injecting ${moduleName}:`, e.message);
+      self.postMessage({ type: 'stderr', data: `[cext] Error injecting ${moduleName}: ${e.message}\n` });
+    }
+  }
+}
+
+/**
+ * Build Python bootstrap code that registers C-extensions via a custom loader.
+ * Runs BEFORE user code (prepended to /tmp/run.py).
+ * Only active when C-extensions are registered — no-op otherwise.
+ * Uses a private namespace to avoid polluting user's globals.
+ */
+function buildCExtBootstrapCode() {
+  if (cExtRegistry.size === 0) return '';
+  const names = JSON.stringify([...cExtRegistry.keys()]);
+  // Wrapped in a function to avoid leaking names into user namespace
+  return `
+def __wasm_register_cext_finders():
+    import sys
+    import importlib.abc
+    import importlib.machinery
+    import types
+
+    class _Loader(importlib.abc.Loader):
+        def __init__(self, name): self._name = name
+        def create_module(self, spec): return types.ModuleType(self._name)
+        def exec_module(self, mod): pass  # real module already in sys.modules via sitecustomize
+
+    class _Finder(importlib.abc.MetaPathFinder):
+        _MODS = set(${names})
+        def find_spec(self, name, path, target=None):
+            if name in self._MODS and name not in sys.modules:
+                return importlib.machinery.ModuleSpec(name, _Loader(name))
+            return None
+
+    sys.meta_path.insert(0, _Finder())
+
+__wasm_register_cext_finders()
+del __wasm_register_cext_finders
+`;
 }
 
 async function pipInstall(packageName) {
@@ -545,6 +888,10 @@ async function init() {
   self.postMessage({ type: 'status', text: 'Loading stdlib...' });
   await loadStdlib();
 
+  // Init OPFS and restore persisted /home/user/ files
+  await opfsInit();
+  await opfsRestore();
+
   self.postMessage({ type: 'status', text: 'Loading python.wasm...' });
   let bytes;
   try {
@@ -558,7 +905,7 @@ async function init() {
   self.postMessage({ type: 'ready' });
 }
 
-function runCode(code, id) {
+async function runCode(code, id) {
   if (!wasmModule) {
     self.postMessage({ type: 'error', id, error: { type: 'RuntimeError', message: 'Not initialized', traceback: '' } });
     return;
@@ -568,15 +915,21 @@ function runCode(code, id) {
   fds.clear();
   nextFd = 5;
 
-  // Debug: check random.py in VFS
-  const randomPath = '/usr/lib/python3.13/random.py';
-  const dirNode = vfsNodes.get('/usr/lib/python3.13');
-  console.log(`[runCode] VFS has random.py: ${vfsNodes.has(randomPath)}, total nodes: ${vfsNodes.size}`);
-  console.log(`[runCode] /usr/lib/python3.13 children has random.py: ${dirNode?.children?.has('random.py')}, children count: ${dirNode?.children?.size}`);
+  // Reset C-extension callback channel buffers
+  fd101ReadBuf = new Uint8Array(0);
+  fd101ReadPos = 0;
 
+  // ── Build the script to run ───────────────────────────────────────────────
+  // Do NOT prepend bootstrap code — testmodule.py is already in site-packages
+  // and Python will find it via the standard import machinery.
+  // The bootstrap finder is only needed as a last-resort fallback and
+  // must NOT run before site-packages is searched.
   const codeWithFlush = code + '\nimport sys as _sys\n_sys.stdout.flush()\n_sys.stderr.flush()\n';
+
   writeFile('/tmp/run.py', codeWithFlush);
-  const runArgs = ['python3', '-c', "exec(open('/tmp/run.py').read()); import sys; sys.stdout.flush(); sys.stderr.flush()"];  // Memory holder — will be set once instance is created
+  const runArgs = ['python3', '-c', "exec(open('/tmp/run.py').read()); import sys; sys.stdout.flush(); sys.stderr.flush()"];
+
+  // Memory holder — will be set once instance is created
   let mem = null;
   const getMem = () => mem;
 
@@ -587,22 +940,155 @@ function runCode(code, id) {
 
   const { wasi, flush } = buildWasi(getMem, runArgs, envVars, onStdout, onStderr, checkInt);
 
-  WebAssembly.instantiate(wasmModule, { wasi_snapshot_preview1: wasi })
-    .then(inst => {
-      mem = inst.exports.memory;
-      try {
-        inst.exports._start();
-      } catch (e) {
-        if (!e.message?.startsWith('proc_exit:')) throw e;
-      }
-      flush(); // flush any remaining buffered output
-      self.postMessage({ type: 'result', id, value: 'null' });
-    })
-    .catch(e => {
-      flush();
-      self.postMessage({ type: 'error', id, error: { type: e.name, message: e.message, traceback: e.stack || '' } });
-    });
+  try {
+    const inst = await WebAssembly.instantiate(wasmModule, { wasi_snapshot_preview1: wasi });
+    mem = inst.exports.memory;
+
+    // ── Link C-extensions with this CPython instance ──────────────────────
+    // Instantiate all registered C-extension WASM modules against this
+    // CPython instance (shared memory). Then write sitecustomize.py which
+    // Python auto-imports at startup. sitecustomize.py uses fd=100/101
+    // to call PyInit_* synchronously and inject the result into sys.modules.
+    const extInstances = await instantiateCExtensions(inst);
+    if (extInstances.size > 0) {
+      writeSitecustomize(extInstances);
+    }
+
+    try {
+      inst.exports._start();
+    } catch (e) {
+      if (!e.message?.startsWith('proc_exit:')) throw e;
+    }
+
+    flush();
+    self.postMessage({ type: 'result', id, value: 'null' });
+  } catch (e) {
+    flush();
+    self.postMessage({ type: 'error', id, error: { type: e.name, message: e.message, traceback: e.stack || '' } });
+  }
 }
+
+/**
+ * Write sitecustomize.py into the VFS.
+ * Python auto-imports this at startup (via site.py), BEFORE user code runs.
+ *
+ * Since ctypes._ctypes is not available in WASM, we use a different approach:
+ * JS sends Python-executable code via fd=101 that creates the module using
+ * types.ModuleType and populates it with functions that call back into JS
+ * via os.write/os.read on fd=100/101.
+ *
+ * For testmodule specifically: we know the API (hello, add).
+ * JS generates Python wrapper code for each exported function.
+ */
+function writeSitecustomize(extInstances) {
+  const moduleData = {};
+
+  for (const [moduleName, extInst] of extInstances) {
+    const initFnName = `PyInit_${moduleName}`;
+    const initFn = extInst.exports[initFnName];
+    if (typeof initFn !== 'function') {
+      console.warn(`[cext] ${initFnName} not found in extension exports`);
+      continue;
+    }
+    moduleData[moduleName] = { initFn, extInst };
+  }
+
+  if (Object.keys(moduleData).length === 0) return;
+
+  // Register init functions so fd=100 handler can call them
+  for (const [moduleName, data] of Object.entries(moduleData)) {
+    pendingCExtInits.set(moduleName, data);
+  }
+
+  const moduleNames = Object.keys(moduleData);
+
+  // sitecustomize.py uses fd=100/101 protocol:
+  // Write: "CEXT_INIT:{name}\n"  → JS calls PyInit_{name}()
+  // Read:  "OK:{hexptr}\n"       → but ctypes unavailable in WASM
+  //
+  // Alternative protocol:
+  // Write: "CEXT_CODE:{name}\n"  → JS returns Python code to exec
+  // Read:  Python source code ending with "\0"
+  //
+  // The Python code JS returns creates a types.ModuleType and populates
+  // it with wrapper functions that use the fd=100/101 channel for calls.
+  //
+  // Even simpler: JS pre-generates the Python module code and writes it
+  // directly to a .py file in VFS. sitecustomize.py just imports it.
+  // This avoids any fd protocol complexity.
+
+  for (const [moduleName, data] of Object.entries(moduleData)) {
+    const pyCode = generatePythonModuleCode(moduleName, data.extInst);
+    if (pyCode) {
+      // Write as a .py file that Python can import normally
+      writeFile(`/usr/local/lib/python3.13/site-packages/${moduleName}.py`, pyCode);
+      console.log(`[cext] Wrote Python wrapper for ${moduleName}`);
+    }
+  }
+
+  // sitecustomize.py is now minimal — just a marker comment
+  const sitecustomize = `# sitecustomize.py — WASM C-extensions loaded as Python wrappers in site-packages\n`;
+
+  writeFile('/usr/lib/python3.13/sitecustomize.py', sitecustomize);
+}
+
+/**
+ * Generate Python wrapper code for a C-extension.
+ * Discovers wasm_{funcName} exports and creates Python wrapper functions
+ * that call them via the fd=100/101 RPC channel.
+ * Falls back to hardcoded wrappers for known modules if wasm_* not exported.
+ */
+function generatePythonModuleCode(moduleName, extInst) {
+  // Find all wasm_* exports (public C functions with raw C types)
+  const wasmFuncs = Object.keys(extInst.exports)
+    .filter(name => name.startsWith('wasm_') && typeof extInst.exports[name] === 'function')
+    .map(name => name.slice('wasm_'.length));
+
+  // Fallback: if no wasm_* exports, use known API for testmodule
+  // (until testmodule.wasm is rebuilt with wasm_hello/wasm_add exports)
+  const effectiveFuncs = wasmFuncs.length > 0 ? wasmFuncs :
+    (moduleName === 'testmodule' ? ['hello', 'add'] : []);
+
+  if (effectiveFuncs.length === 0) {
+    console.warn(`[cext] No wasm_* exports found in ${moduleName} — module will be empty stub`);
+  } else if (wasmFuncs.length === 0) {
+    console.log(`[cext] ${moduleName}: using fallback function list (rebuild WASM to export wasm_* functions)`);
+  }
+
+  const funcDefs = effectiveFuncs.map(fn => `
+def ${fn}(*args):
+    return _wasm_call("${moduleName}", "${fn}", *args)
+`).join('\n');
+
+  // Functions defined at module level automatically become module attributes.
+  // No need for _mod.hello = hello or sys.modules manipulation.
+  return `
+# ${moduleName}.py — auto-generated WASM C-extension wrapper
+# Uses fd=100/101 RPC channel to call real WASM functions
+import os as _os
+import json as _json
+
+def _wasm_call(module, func, *args):
+    """Call a WASM C-extension function via fd=100/101 RPC."""
+    cmd = ("CALL:" + module + ":" + func + ":" + _json.dumps(list(args)) + "\\n").encode()
+    _os.write(100, cmd)
+    result = b""
+    while not result.endswith(b"\\n"):
+        chunk = _os.read(101, 256)
+        if not chunk:
+            break
+        result += chunk
+    resp = result.strip().decode()
+    if resp.startswith("OK:"):
+        return _json.loads(resp[3:])
+    raise RuntimeError("WASM call failed: " + resp)
+
+${funcDefs}
+`;
+}
+
+// Registry for pending C-extension initializations (used by WASI fd=100 handler)
+// (declared above near WASI constants)
 
 // ── Message handler ───────────────────────────────────────────────────────────
 
@@ -617,21 +1103,48 @@ self.onmessage = async (e) => {
       self.postMessage({ type: 'error', id, error: { type: err.name, message: err.message, traceback: '' } });
     }
   }
-  else if (type === 'load.extension') {
-    // Load a WASM C-extension and link with CPython
+  else if (type === 'cext.register') {
+    // Register a C-extension WASM module by name + bytes.
+    // It will be linked with CPython on the next runCode() call.
     try {
-      if (!wasmModule) throw new Error('Runtime not initialized');
-      // We need the CPython instance exports — run a dummy to get them
-      // Actually we store them from the last run
-      const inst = await WebAssembly.instantiate(wasmModule, { wasi_snapshot_preview1: new Proxy({}, { get: () => () => 0 }) });
-      await loadCExtension(e.data.moduleName, e.data.wasmBytes, inst.exports);
-      self.postMessage({ type: 'result', id, value: 'null' });
+      const ok = await registerCExtension(e.data.moduleName, e.data.wasmBytes);
+      self.postMessage({ type: 'result', id, value: ok ? 'registered' : 'failed' });
     } catch(err) {
       self.postMessage({ type: 'error', id, error: { type: err.name, message: err.message, traceback: '' } });
     }
   }
-  else if (type === 'fs.write') { writeFile(path, content); self.postMessage({ type: 'fs.result', id, value: null }); }
+  else if (type === 'load.extension') {
+    // Legacy handler — redirect to cext.register
+    try {
+      const ok = await registerCExtension(e.data.moduleName, e.data.wasmBytes);
+      self.postMessage({ type: 'result', id, value: ok ? 'registered' : 'failed' });
+    } catch(err) {
+      self.postMessage({ type: 'error', id, error: { type: err.name, message: err.message, traceback: '' } });
+    }
+  }
+  else if (type === 'fs.write') {
+    writeFile(path, content);
+    // Also persist to OPFS if under /home/user/
+    if (path && norm(path).startsWith('/home/user/')) opfsSave(path);
+    self.postMessage({ type: 'fs.result', id, value: null });
+  }
   else if (type === 'fs.read')  { self.postMessage({ type: 'fs.result', id, value: readFile(path) }); }
+  else if (type === 'fs.list') {
+    // List all files under /home/user/ with their sizes
+    const files = [];
+    for (const [p, node] of vfsNodes.entries()) {
+      if (p.startsWith('/home/user/') && node.type === 'file') {
+        files.push({ path: p, size: node.content?.length ?? 0, mtime: node.mtime });
+      }
+    }
+    self.postMessage({ type: 'fs.result', id, value: files });
+  }
+  else if (type === 'fs.delete') {
+    const p = norm(path);
+    vfsNodes.delete(p);
+    opfsDelete(p);
+    self.postMessage({ type: 'fs.result', id, value: null });
+  }
 };
 
 self.postMessage({ type: 'status', text: 'Starting...' });

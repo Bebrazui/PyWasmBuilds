@@ -120,11 +120,13 @@ jobs:
               -o /tmp/ext-build/${name}.o \
               "$src"
 
-            # Link as WASM module — import Python C API functions, export PyInit_*
+            # Link as WASM module — import Python C API functions, export PyInit_* and wasm_*
             /opt/wasi-sdk/bin/wasm-ld \
               --no-entry \
               --allow-undefined \
               --export=PyInit_${name} \
+              --export=wasm_hello \
+              --export=wasm_add \
               --import-memory \
               -o /tmp/ext-build/${name}.wasm \
               /tmp/ext-build/${name}.o
