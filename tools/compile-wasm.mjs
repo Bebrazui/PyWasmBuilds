@@ -196,75 +196,89 @@ async function findWasiSdk() {
 }
 
 async function findOrDownloadWindows() {
-  // On Windows we need:
-  //   1. clang.exe with wasm32-wasi target support (from LLVM)
-  //   2. wasm-ld.exe (from LLVM)
-  //   3. WASI sysroot (headers + libc, from wasi-sdk sysroot tarball)
-
   const llvmDir    = join(CACHE_DIR, 'llvm');
   const sysrootDir = join(CACHE_DIR, 'wasi-sysroot');
 
   const clangExe  = join(llvmDir, 'bin', 'clang.exe');
   const wasmLdExe = join(llvmDir, 'bin', 'wasm-ld.exe');
 
-  // Check if LLVM already installed system-wide
+  // Check if LLVM already installed system-wide (PATH or common locations)
   const systemClang = spawnSync('clang', ['--version'], { encoding: 'utf8', shell: true });
-  if (systemClang.status === 0 && systemClang.stdout.includes('clang')) {
+  if (systemClang.status === 0) {
     const systemWasmLd = spawnSync('wasm-ld', ['--version'], { encoding: 'utf8', shell: true });
     if (systemWasmLd.status === 0) {
-      ok('Found system LLVM (clang + wasm-ld)');
+      ok('Found system LLVM (clang + wasm-ld) in PATH');
       const sysroot = await ensureWasiSysroot(sysrootDir);
       return { clang: 'clang', wasmLd: 'wasm-ld', sysroot };
     }
   }
 
-  // Check cached LLVM
-  if (existsSync(clangExe) && existsSync(wasmLdExe)) {
-    ok(`Using cached LLVM at ${llvmDir}`);
-    const sysroot = await ensureWasiSysroot(sysrootDir);
-    return { clang: clangExe, wasmLd: wasmLdExe, sysroot };
+  // Check common Windows install locations (LLVM installer default)
+  const winCandidates = [
+    'C:\\Program Files\\LLVM',
+    'C:\\Program Files (x86)\\LLVM',
+    join(process.env.LOCALAPPDATA || '', 'Programs', 'LLVM'),
+    llvmDir,
+  ];
+  for (const p of winCandidates) {
+    const c = join(p, 'bin', 'clang.exe');
+    const w = join(p, 'bin', 'wasm-ld.exe');
+    if (existsSync(c) && existsSync(w)) {
+      ok(`Found LLVM at ${p}`);
+      const sysroot = await ensureWasiSysroot(sysrootDir);
+      return { clang: c, wasmLd: w, sysroot };
+    }
   }
 
   if (noDownload) throw new Error('LLVM not found. Install LLVM from https://releases.llvm.org/ or remove --no-download.');
 
-  // Download LLVM installer for Windows and extract (silent install to cache dir)
-  log(`Downloading LLVM ${LLVM_VERSION} for Windows (~300MB, one-time download)...`);
-  log('This may take a few minutes on first run. Cached for future use.');
+  // LLVM provides a .zip for Windows — no installer, no admin rights, no xz needed
+  // The zip contains clang.exe, wasm-ld.exe and all needed tools
+  const llvmZipUrl = `https://github.com/llvm/llvm-project/releases/download/llvmorg-${LLVM_VERSION}/clang+llvm-${LLVM_VERSION}-x86_64-pc-windows-msvc.zip`;
 
-  // Use the zip version instead of installer — smaller and no admin rights needed
-  // LLVM provides a zip archive for Windows
-  const llvmZipUrl = `https://github.com/llvm/llvm-project/releases/download/llvmorg-${LLVM_VERSION}/clang+llvm-${LLVM_VERSION}-x86_64-pc-windows-msvc.tar.xz`;
-  const tmpFile = join(tmpdir(), `llvm-${Date.now()}.tar.xz`);
+  log(`Downloading LLVM ${LLVM_VERSION} for Windows (~300MB, one-time)...`);
+  log('Cached in .wasm-build-cache/ for future use.');
 
+  const tmpZip = join(tmpdir(), `llvm-${Date.now()}.zip`);
   mkdirSync(llvmDir, { recursive: true });
 
-  try {
-    await download(llvmZipUrl, tmpFile);
-    log('Extracting LLVM (this takes a moment)...');
-    // Use tar (available on Windows 10+) to extract .tar.xz
-    run(`tar -xJf "${tmpFile}" -C "${llvmDir}" --strip-components=1`);
-    ok(`LLVM extracted to ${llvmDir}`);
-  } catch (e) {
-    // Fallback: try the .exe installer with /S flag (silent)
-    warn(`tar.xz extraction failed: ${e.message}`);
-    warn('Trying LLVM installer...');
-    const exeFile = join(tmpdir(), `llvm-${Date.now()}.exe`);
-    await download(LLVM_WIN_URL, exeFile);
-    log('Running LLVM installer silently (may need a moment)...');
-    run(`"${exeFile}" /S /D="${llvmDir}"`);
-    ok('LLVM installed');
+  await download(llvmZipUrl, tmpZip);
+  log('Extracting LLVM via PowerShell...');
+
+  // Use PowerShell Expand-Archive — available on all Windows 10+, no xz needed
+  const psCmd = `Expand-Archive -Path "${tmpZip}" -DestinationPath "${join(CACHE_DIR, '_llvm_tmp')}" -Force`;
+  const ps = spawnSync('powershell', ['-NoProfile', '-Command', psCmd], { encoding: 'utf8' });
+  if (ps.status !== 0) {
+    throw new Error(`PowerShell extraction failed: ${ps.stderr}`);
+  }
+
+  // The zip has a top-level directory — move its contents to llvmDir
+  const { readdirSync, renameSync } = await import('fs');
+  const tmpExtract = join(CACHE_DIR, '_llvm_tmp');
+  const entries = readdirSync(tmpExtract);
+  if (entries.length === 1) {
+    // Single top-level dir — move its contents
+    const innerDir = join(tmpExtract, entries[0]);
+    const { cpSync, rmSync } = await import('fs');
+    cpSync(innerDir, llvmDir, { recursive: true });
+    rmSync(tmpExtract, { recursive: true, force: true });
   }
 
   if (!existsSync(clangExe)) {
-    throw new Error(`LLVM installation failed — clang.exe not found at ${clangExe}`);
+    throw new Error(`LLVM extraction failed — clang.exe not found at ${clangExe}`);
   }
 
+  ok(`LLVM ready at ${llvmDir}`);
   const sysroot = await ensureWasiSysroot(sysrootDir);
   return { clang: clangExe, wasmLd: wasmLdExe, sysroot };
 }
 
 async function ensureWasiSysroot(sysrootDir) {
-  if (existsSync(join(sysrootDir, 'include', 'wasi'))) {
+  // Check multiple possible structures
+  const isReady = existsSync(join(sysrootDir, 'include', 'wasi')) ||
+                  existsSync(join(sysrootDir, 'include', 'wasm32-wasi')) ||
+                  existsSync(join(sysrootDir, 'lib', 'wasm32-wasi'));
+  if (isReady) {
     ok(`Using cached WASI sysroot`);
     return sysrootDir;
   }
@@ -273,7 +287,24 @@ async function ensureWasiSysroot(sysrootDir) {
 
   log(`Downloading WASI sysroot (~15MB)...`);
   mkdirSync(CACHE_DIR, { recursive: true });
-  await downloadAndExtractTar(WASI_SYSROOT_URL, sysrootDir);
+
+  const isWin = platform() === 'win32';
+  const tmpFile = join(tmpdir(), `wasi-sysroot-${Date.now()}.tar.gz`);
+  await download(WASI_SYSROOT_URL, tmpFile);
+
+  mkdirSync(sysrootDir, { recursive: true });
+
+  if (isWin) {
+    // Windows tar supports .tar.gz (gzip) but not .tar.xz
+    // Use tar directly — Windows 10+ has BSD tar which handles .tar.gz fine
+    const result = spawnSync('tar', ['-xzf', tmpFile, '-C', sysrootDir, '--strip-components=1'], { encoding: 'utf8' });
+    if (result.status !== 0) {
+      throw new Error(`Failed to extract WASI sysroot: ${result.stderr}`);
+    }
+  } else {
+    run(`tar -xzf "${tmpFile}" -C "${sysrootDir}" --strip-components=1`);
+  }
+
   ok(`WASI sysroot ready at ${sysrootDir}`);
   return sysrootDir;
 }
@@ -287,7 +318,7 @@ async function getCPythonHeaders() {
 
   if (existsSync(includeDir) && existsSync(pyconfigPath)) {
     ok(`Using cached CPython headers at ${headersDir}`);
-    return { includeDir, pyconfigDir: headersDir };
+    return { includeDir, pyconfigDir: headersDir, pyconfigPath };
   }
 
   if (noDownload) {
@@ -320,8 +351,12 @@ async function getCPythonHeaders() {
     writeFileSync(pyconfigPath, generateMinimalPyconfig());
   }
 
+  // Python.h does #include "pyconfig.h" — copy it into Include/ so clang finds it
+  const { copyFileSync } = await import('fs');
+  copyFileSync(pyconfigPath, join(includeDir, 'pyconfig.h'));
+
   ok(`CPython headers ready at ${headersDir}`);
-  return { includeDir, pyconfigDir: headersDir };
+  return { includeDir, pyconfigDir: headersDir, pyconfigPath };
 }
 
 function generateMinimalPyconfig() {
@@ -406,7 +441,6 @@ async function compile(srcPath, toolchain, headers) {
     `--sysroot="${sysroot}"`,
     `-I"${headers.includeDir}"`,
     `-I"${join(headers.includeDir, 'cpython')}"`,
-    `-I"${headers.pyconfigDir}"`,
     '-DPy_BUILD_CORE_BUILTIN=1',
     '-O2',
     '-c',
