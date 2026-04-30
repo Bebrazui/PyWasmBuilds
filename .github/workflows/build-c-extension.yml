@@ -103,6 +103,9 @@ jobs:
         run: |
           mkdir -p /tmp/ext-build
 
+          # Copy pyconfig.h with a stable name for the CLI tool
+          cp ${{ env.PYCONFIG_DIR }}/pyconfig.h /tmp/ext-build/pyconfig-wasm32-wasi.h
+
           for src in c-extensions/*.c; do
             name=$(basename "$src" .c)
             echo "=== Compiling $name ==="
@@ -120,13 +123,24 @@ jobs:
               -o /tmp/ext-build/${name}.o \
               "$src"
 
-            # Link as WASM module — import Python C API functions, export PyInit_* and wasm_*
+            # Auto-detect wasm_* exports from source file
+            WASM_EXPORTS=$(grep -oP '(?<=__attribute__\(\(visibility\("default"\)\)\)\s{0,10})\w+\s+(wasm_\w+)(?=\s*\()' "$src" | grep -oP 'wasm_\w+' || true)
+            PYINIT_EXPORTS=$(grep -oP 'PyInit_\w+(?=\s*\()' "$src" || true)
+            ALL_EXPORTS=$(echo "$WASM_EXPORTS $PYINIT_EXPORTS" | tr ' ' '\n' | grep -v '^$' | sort -u)
+
+            if [ -z "$ALL_EXPORTS" ]; then
+              echo "WARNING: No wasm_* or PyInit_* exports found in $src"
+              EXPORT_FLAGS="--export=PyInit_${name}"
+            else
+              EXPORT_FLAGS=$(echo "$ALL_EXPORTS" | sed 's/^/--export=/' | tr '\n' ' ')
+              echo "Exports: $ALL_EXPORTS"
+            fi
+
+            # Link as WASM module
             /opt/wasi-sdk/bin/wasm-ld \
               --no-entry \
               --allow-undefined \
-              --export=PyInit_${name} \
-              --export=wasm_hello \
-              --export=wasm_add \
+              $EXPORT_FLAGS \
               --import-memory \
               -o /tmp/ext-build/${name}.wasm \
               /tmp/ext-build/${name}.o
@@ -149,6 +163,8 @@ jobs:
         uses: softprops/action-gh-release@v2
         with:
           tag_name: "cpython-wasm-v3.13.0"
-          files: /tmp/ext-build/*.wasm
+          files: |
+            /tmp/ext-build/*.wasm
+            /tmp/ext-build/pyconfig-wasm32-wasi.h
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
