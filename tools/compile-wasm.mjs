@@ -134,61 +134,148 @@ async function downloadAndExtractTar(url, destDir) {
   run(`tar -xzf "${tmpFile}" -C "${destDir}" --strip-components=1`);
 }
 
-// ── Step 1: Find or download wasi-sdk ─────────────────────────────────────────
+// ── Step 1: Find or download compiler toolchain ───────────────────────────────
+//
+// Strategy by platform:
+//   Linux/macOS: download wasi-sdk (clang + wasm-ld bundled)
+//   Windows:     download LLVM (has clang.exe + wasm-ld.exe) + WASI sysroot separately
+//
+// wasi-sdk on Windows is not officially supported, but LLVM's clang.exe
+// supports --target=wasm32-wasi natively. We just need the WASI sysroot
+// (headers + libc) which is a separate download.
+
+const LLVM_VERSION   = '18.1.8';
+const LLVM_WIN_URL   = `https://github.com/llvm/llvm-project/releases/download/llvmorg-${LLVM_VERSION}/LLVM-${LLVM_VERSION}-win64.exe`;
+// WASI sysroot from wasi-sdk (just the sysroot, not the full SDK)
+const WASI_SYSROOT_URL = `https://github.com/WebAssembly/wasi-sdk/releases/download/wasi-sdk-${WASI_SDK_VERSION}/wasi-sysroot-${WASI_SDK_VERSION}.0.tar.gz`;
 
 async function findWasiSdk() {
-  // 1. User-specified path
+  const isWin = platform() === 'win32';
+
+  if (isWin) {
+    return findOrDownloadWindows();
+  }
+
+  // Linux / macOS: use wasi-sdk bundle
   if (wasiSdkPath) {
     if (!existsSync(join(wasiSdkPath, 'bin', 'clang'))) {
       throw new Error(`wasi-sdk not found at ${wasiSdkPath}`);
     }
-    return wasiSdkPath;
+    return { clang: join(wasiSdkPath, 'bin', 'clang'), wasmLd: join(wasiSdkPath, 'bin', 'wasm-ld'), sysroot: join(wasiSdkPath, 'share', 'wasi-sysroot') };
   }
 
-  // 2. Common install locations
   const candidates = [
     '/opt/wasi-sdk',
     '/usr/local/wasi-sdk',
-    join(ROOT, '.wasm-build-cache', 'wasi-sdk'),
+    join(CACHE_DIR, 'wasi-sdk'),
     join(process.env.HOME || '', '.wasi-sdk'),
   ];
   for (const p of candidates) {
-    const clang = join(p, 'bin', 'clang');
-    if (existsSync(clang)) {
+    if (existsSync(join(p, 'bin', 'clang'))) {
       ok(`Found wasi-sdk at ${p}`);
-      return p;
+      return { clang: join(p, 'bin', 'clang'), wasmLd: join(p, 'bin', 'wasm-ld'), sysroot: join(p, 'share', 'wasi-sysroot') };
     }
   }
 
-  // 3. Auto-download
-  if (noDownload) {
-    throw new Error('wasi-sdk not found. Install it or remove --no-download to auto-download.');
-  }
+  if (noDownload) throw new Error('wasi-sdk not found. Install it or remove --no-download.');
 
   const sdkDir = join(CACHE_DIR, 'wasi-sdk');
   if (existsSync(join(sdkDir, 'bin', 'clang'))) {
-    ok(`Using cached wasi-sdk at ${sdkDir}`);
-    return sdkDir;
+    ok(`Using cached wasi-sdk`);
+    return { clang: join(sdkDir, 'bin', 'clang'), wasmLd: join(sdkDir, 'bin', 'wasm-ld'), sysroot: join(sdkDir, 'share', 'wasi-sysroot') };
   }
 
-  log(`wasi-sdk not found, downloading v${WASI_SDK_VERSION}...`);
-
+  log(`Downloading wasi-sdk v${WASI_SDK_VERSION}...`);
   const os = platform();
-  let sdkPlatform;
-  if (os === 'linux')  sdkPlatform = 'x86_64-linux';
-  else if (os === 'darwin') sdkPlatform = arch() === 'arm64' ? 'arm64-macos' : 'x86_64-macos';
-  else if (os === 'win32') {
-    // Windows: use WSL or mingw build
-    warn('Windows detected. Trying to use WSL for compilation...');
-    return 'WSL';
-  }
-  else throw new Error(`Unsupported platform: ${os}`);
-
+  const sdkPlatform = os === 'darwin' ? (arch() === 'arm64' ? 'arm64-macos' : 'x86_64-macos') : 'x86_64-linux';
   const url = `https://github.com/WebAssembly/wasi-sdk/releases/download/wasi-sdk-${WASI_SDK_VERSION}/wasi-sdk-${WASI_SDK_VERSION}.0-${sdkPlatform}.tar.gz`;
   mkdirSync(CACHE_DIR, { recursive: true });
   await downloadAndExtractTar(url, sdkDir);
-  ok(`wasi-sdk downloaded to ${sdkDir}`);
-  return sdkDir;
+  ok(`wasi-sdk ready`);
+  return { clang: join(sdkDir, 'bin', 'clang'), wasmLd: join(sdkDir, 'bin', 'wasm-ld'), sysroot: join(sdkDir, 'share', 'wasi-sysroot') };
+}
+
+async function findOrDownloadWindows() {
+  // On Windows we need:
+  //   1. clang.exe with wasm32-wasi target support (from LLVM)
+  //   2. wasm-ld.exe (from LLVM)
+  //   3. WASI sysroot (headers + libc, from wasi-sdk sysroot tarball)
+
+  const llvmDir    = join(CACHE_DIR, 'llvm');
+  const sysrootDir = join(CACHE_DIR, 'wasi-sysroot');
+
+  const clangExe  = join(llvmDir, 'bin', 'clang.exe');
+  const wasmLdExe = join(llvmDir, 'bin', 'wasm-ld.exe');
+
+  // Check if LLVM already installed system-wide
+  const systemClang = spawnSync('clang', ['--version'], { encoding: 'utf8', shell: true });
+  if (systemClang.status === 0 && systemClang.stdout.includes('clang')) {
+    const systemWasmLd = spawnSync('wasm-ld', ['--version'], { encoding: 'utf8', shell: true });
+    if (systemWasmLd.status === 0) {
+      ok('Found system LLVM (clang + wasm-ld)');
+      const sysroot = await ensureWasiSysroot(sysrootDir);
+      return { clang: 'clang', wasmLd: 'wasm-ld', sysroot };
+    }
+  }
+
+  // Check cached LLVM
+  if (existsSync(clangExe) && existsSync(wasmLdExe)) {
+    ok(`Using cached LLVM at ${llvmDir}`);
+    const sysroot = await ensureWasiSysroot(sysrootDir);
+    return { clang: clangExe, wasmLd: wasmLdExe, sysroot };
+  }
+
+  if (noDownload) throw new Error('LLVM not found. Install LLVM from https://releases.llvm.org/ or remove --no-download.');
+
+  // Download LLVM installer for Windows and extract (silent install to cache dir)
+  log(`Downloading LLVM ${LLVM_VERSION} for Windows (~300MB, one-time download)...`);
+  log('This may take a few minutes on first run. Cached for future use.');
+
+  // Use the zip version instead of installer — smaller and no admin rights needed
+  // LLVM provides a zip archive for Windows
+  const llvmZipUrl = `https://github.com/llvm/llvm-project/releases/download/llvmorg-${LLVM_VERSION}/clang+llvm-${LLVM_VERSION}-x86_64-pc-windows-msvc.tar.xz`;
+  const tmpFile = join(tmpdir(), `llvm-${Date.now()}.tar.xz`);
+
+  mkdirSync(llvmDir, { recursive: true });
+
+  try {
+    await download(llvmZipUrl, tmpFile);
+    log('Extracting LLVM (this takes a moment)...');
+    // Use tar (available on Windows 10+) to extract .tar.xz
+    run(`tar -xJf "${tmpFile}" -C "${llvmDir}" --strip-components=1`);
+    ok(`LLVM extracted to ${llvmDir}`);
+  } catch (e) {
+    // Fallback: try the .exe installer with /S flag (silent)
+    warn(`tar.xz extraction failed: ${e.message}`);
+    warn('Trying LLVM installer...');
+    const exeFile = join(tmpdir(), `llvm-${Date.now()}.exe`);
+    await download(LLVM_WIN_URL, exeFile);
+    log('Running LLVM installer silently (may need a moment)...');
+    run(`"${exeFile}" /S /D="${llvmDir}"`);
+    ok('LLVM installed');
+  }
+
+  if (!existsSync(clangExe)) {
+    throw new Error(`LLVM installation failed — clang.exe not found at ${clangExe}`);
+  }
+
+  const sysroot = await ensureWasiSysroot(sysrootDir);
+  return { clang: clangExe, wasmLd: wasmLdExe, sysroot };
+}
+
+async function ensureWasiSysroot(sysrootDir) {
+  if (existsSync(join(sysrootDir, 'include', 'wasi'))) {
+    ok(`Using cached WASI sysroot`);
+    return sysrootDir;
+  }
+
+  if (noDownload) throw new Error('WASI sysroot not found. Remove --no-download to auto-download.');
+
+  log(`Downloading WASI sysroot (~15MB)...`);
+  mkdirSync(CACHE_DIR, { recursive: true });
+  await downloadAndExtractTar(WASI_SYSROOT_URL, sysrootDir);
+  ok(`WASI sysroot ready at ${sysrootDir}`);
+  return sysrootDir;
 }
 
 // ── Step 2: Get CPython headers ───────────────────────────────────────────────
@@ -292,7 +379,7 @@ function findWasmExports(srcPath) {
 
 // ── Step 4: Compile ───────────────────────────────────────────────────────────
 
-async function compile(srcPath, sdkPath, headers) {
+async function compile(srcPath, toolchain, headers) {
   const name = basename(srcPath, '.c');
   const buildDir = join(CACHE_DIR, 'build');
   mkdirSync(buildDir, { recursive: true });
@@ -303,7 +390,6 @@ async function compile(srcPath, sdkPath, headers) {
 
   log(`Compiling ${basename(srcPath)}...`);
 
-  // Find all wasm_* and PyInit_* exports
   const exports = findWasmExports(srcPath);
   if (exports.length === 0) {
     warn(`No wasm_* or PyInit_* functions found in ${basename(srcPath)}`);
@@ -312,19 +398,8 @@ async function compile(srcPath, sdkPath, headers) {
     log(`Found exports: ${exports.join(', ')}`);
   }
 
-  const isWindows = platform() === 'win32';
+  const { clang, wasmLd, sysroot } = toolchain;
 
-  if (sdkPath === 'WSL') {
-    // Windows: run via WSL
-    await compileViaWSL(srcPath, name, exports, headers, wasmPath);
-    return wasmPath;
-  }
-
-  const clang   = join(sdkPath, 'bin', 'clang');
-  const wasmLd  = join(sdkPath, 'bin', 'wasm-ld');
-  const sysroot = join(sdkPath, 'share', 'wasi-sysroot');
-
-  // Compile to object file
   const compileCmd = [
     `"${clang}"`,
     '--target=wasm32-wasi',
@@ -341,7 +416,6 @@ async function compile(srcPath, sdkPath, headers) {
 
   run(compileCmd);
 
-  // Link to WASM module
   const exportFlags = exports.map(e => `--export=${e}`).join(' ');
   const linkCmd = [
     `"${wasmLd}"`,
@@ -357,59 +431,8 @@ async function compile(srcPath, sdkPath, headers) {
 
   const size = readFileSync(wasmPath).length;
   ok(`${name}.wasm → ${wasmPath} (${size} bytes)`);
-
-  // Verify exports
   await verifyWasm(wasmPath, exports);
-
   return wasmPath;
-}
-
-async function compileViaWSL(srcPath, name, exports, headers, wasmPath) {
-  // Check WSL is available
-  try { run('wsl --version', { stdio: 'pipe' }); } catch {
-    throw new Error('WSL not available. Install WSL2 or use Linux/macOS to compile.');
-  }
-
-  log('Using WSL for compilation...');
-
-  // Convert Windows paths to WSL paths
-  const toWsl = (p) => p.replace(/\\/g, '/').replace(/^([A-Z]):/, (_, d) => `/mnt/${d.toLowerCase()}`);
-
-  const wslSrc     = toWsl(srcPath);
-  const wslOut     = toWsl(wasmPath);
-  const wslHeaders = toWsl(headers.includeDir);
-  const wslPyconf  = toWsl(headers.pyconfigDir);
-  const wslBuild   = toWsl(join(CACHE_DIR, 'build'));
-  const wslObj     = `${wslBuild}/${name}.o`;
-
-  // Install wasi-sdk in WSL if needed
-  const wslSdkCheck = spawnSync('wsl', ['test', '-f', '/opt/wasi-sdk/bin/clang'], { encoding: 'utf8' });
-  if (wslSdkCheck.status !== 0) {
-    log('Installing wasi-sdk in WSL...');
-    const installScript = `
-      set -e
-      URL="https://github.com/WebAssembly/wasi-sdk/releases/download/wasi-sdk-24/wasi-sdk-24.0-x86_64-linux.tar.gz"
-      wget -q "$URL" -O /tmp/wasi-sdk.tar.gz
-      sudo tar -xzf /tmp/wasi-sdk.tar.gz -C /opt
-      sudo mv /opt/wasi-sdk-24.0-x86_64-linux /opt/wasi-sdk
-    `;
-    run(`wsl bash -c "${installScript.replace(/\n/g, '; ')}"`);
-  }
-
-  const exportFlags = exports.map(e => `--export=${e}`).join(' ');
-
-  const compileScript = `
-    /opt/wasi-sdk/bin/clang --target=wasm32-wasi --sysroot=/opt/wasi-sdk/share/wasi-sysroot \
-      -I"${wslHeaders}" -I"${wslHeaders}/cpython" -I"${wslPyconf}" \
-      -DPy_BUILD_CORE_BUILTIN=1 -O2 -c "${wslSrc}" -o "${wslObj}" && \
-    /opt/wasi-sdk/bin/wasm-ld --no-entry --allow-undefined ${exportFlags} --import-memory \
-      "${wslObj}" -o "${wslOut}"
-  `.trim().replace(/\n\s+/g, ' ');
-
-  run(`wsl bash -c "${compileScript}"`);
-
-  const size = readFileSync(wasmPath).length;
-  ok(`${name}.wasm → ${wasmPath} (${size} bytes)`);
 }
 
 async function verifyWasm(wasmPath, expectedExports) {
@@ -435,8 +458,8 @@ async function main() {
 
   mkdirSync(CACHE_DIR, { recursive: true });
 
-  log('Finding wasi-sdk...');
-  const sdkPath = await findWasiSdk();
+  log('Finding compiler toolchain...');
+  const toolchain = await findWasiSdk();
 
   log('Getting CPython headers...');
   const headers = await getCPythonHeaders();
@@ -448,7 +471,7 @@ async function main() {
       process.exit(1);
     }
     try {
-      const wasmPath = await compile(src, sdkPath, headers);
+      const wasmPath = await compile(src, toolchain, headers);
       results.push({ src, wasmPath, ok: true });
     } catch (e) {
       err(`Failed to compile ${basename(src)}: ${e.message}`);
