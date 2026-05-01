@@ -1,0 +1,30 @@
+{
+  "name": "serpent-wasm",
+  "version": "0.4.0",
+  "description": "CPython 3.13 in WebAssembly (wasm32-wasi) — run Python natively in the browser without Emscripten",
+  "type": "module",
+  "main": "./dist/index.js",
+  "module": "./dist/index.js",
+  "types": "./dist/index.d.ts",
+  "exports": {
+    ".": {
+      "import": "./dist/index.js",
+      "types": "./dist/index.d.ts"
+    },
+    "./worker": "./dist/worker.js"
+  },
+  "files": [
+    "dist/",
+    "README.md"
+  ],
+  "scripts": {
+    "build": "tsc && node scripts/sync-worker.mjs",
+    "prepublishOnly": "npm run build",
+    "test": "node test/basic.mjs"
+  },
+  "keywords": ["python", "wasm", "webassembly", "wasi", "cpython", "browser", "serpent"],
+  "license": "MIT",
+  "devDependencies": {
+    "typescript": "^5.5.0"
+  }
+}

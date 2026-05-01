@@ -1,7 +1,7 @@
 {
-  "name": "python-wasm-runtime",
+  "name": "serpent-wasm-runtime",
   "version": "0.1.0",
-  "description": "Python WASM Runtime — CPython compiled to wasm32-wasi, running in the browser",
+  "description": "Serpent — CPython 3.13 WASM Runtime (wasm32-wasi) for the browser",
   "type": "module",
   "main": "./dist/index.js",
   "types": "./dist/index.d.ts",
