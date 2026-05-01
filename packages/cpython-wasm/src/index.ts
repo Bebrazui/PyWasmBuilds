@@ -1,5 +1,5 @@
 /**
- * cpython-wasm — CPython 3.13 in WebAssembly
+ * cpython-wasm — CPython 3.13 in WebAssembly (wasm32-wasi)
  *
  * Usage:
  *   import { PythonRuntime } from 'cpython-wasm';
@@ -8,6 +8,8 @@
  *   py.onStdout = (line) => console.log(line);
  *   await py.init();
  *   await py.run('print("Hello from Python!")');
+ *   await py.pip('requests');
+ *   await py.fs.writeFile('/home/user/data.txt', 'hello');
  */
 
 const GITHUB_RELEASE = 'https://github.com/Bebrazui/PyWasmBuilds/releases/download/cpython-wasm-v3.13.0';
@@ -15,78 +17,121 @@ const GITHUB_RELEASE = 'https://github.com/Bebrazui/PyWasmBuilds/releases/downlo
 const DEFAULT_WASM_URL   = `${GITHUB_RELEASE}/python.wasm`;
 const DEFAULT_STDLIB_URL = `${GITHUB_RELEASE}/python313-stdlib.zip`;
 
+// ── Public types ──────────────────────────────────────────────────────────────
+
 export interface PythonRuntimeOptions {
   /** URL to python.wasm binary. Defaults to GitHub Releases. */
   wasmUrl?: string;
   /** URL to python313-stdlib.zip. Defaults to GitHub Releases. */
   stdlibUrl?: string;
-  /** URL to the worker script. Defaults to auto-resolved worker.js */
+  /** URL to the worker script. Defaults to bundled worker.js */
   workerUrl?: string;
 }
 
 export interface RunResult {
-  /** Exit code from Python process (0 = success) */
   exitCode: number;
 }
 
+export interface FileEntry {
+  path: string;
+  size: number;
+  mtime: number;
+}
+
+export interface InstallResult {
+  name: string;
+  version: string;
+}
+
+// ── FSProxy ───────────────────────────────────────────────────────────────────
+
+export class FSProxy {
+  constructor(private _send: (msg: object) => Promise<unknown>) {}
+
+  /** Write a file into the virtual filesystem (persisted to OPFS if under /home/user/) */
+  async writeFile(path: string, content: string | Uint8Array): Promise<void> {
+    const bytes = typeof content === 'string' ? new TextEncoder().encode(content) : content;
+    await this._send({ type: 'fs.write', path, content: bytes });
+  }
+
+  /** Read a file from the virtual filesystem */
+  async readFile(path: string): Promise<Uint8Array> {
+    const result = await this._send({ type: 'fs.read', path });
+    return result as Uint8Array;
+  }
+
+  /** List all persisted files under /home/user/ */
+  async list(): Promise<FileEntry[]> {
+    const result = await this._send({ type: 'fs.list' });
+    return result as FileEntry[];
+  }
+
+  /** Delete a file from VFS and OPFS */
+  async delete(path: string): Promise<void> {
+    await this._send({ type: 'fs.delete', path });
+  }
+}
+
+// ── PythonRuntime ─────────────────────────────────────────────────────────────
+
 export class PythonRuntime {
   private worker: Worker | null = null;
-  private opts: PythonRuntimeOptions;
+  private opts: Required<PythonRuntimeOptions>;
   private ready = false;
-  private pendingRuns = new Map<string, { resolve: (r: RunResult) => void; reject: (e: Error) => void }>();
-  private runCounter = 0;
+  private pending = new Map<string, { resolve: (v: unknown) => void; reject: (e: Error) => void }>();
+  private counter = 0;
 
-  /** Called for each line written to stdout */
-  onStdout: (line: string) => void = () => {};
-  /** Called for each line written to stderr */
-  onStderr: (line: string) => void = () => {};
+  /** Called for each chunk written to stdout */
+  onStdout: (data: string) => void = () => {};
+  /** Called for each chunk written to stderr */
+  onStderr: (data: string) => void = () => {};
+  /** Called for status updates during init */
+  onStatus: (text: string) => void = () => {};
+
+  /** Virtual filesystem proxy */
+  readonly fs: FSProxy;
 
   constructor(opts?: PythonRuntimeOptions) {
     this.opts = {
       wasmUrl:   opts?.wasmUrl   ?? DEFAULT_WASM_URL,
       stdlibUrl: opts?.stdlibUrl ?? DEFAULT_STDLIB_URL,
-      workerUrl: opts?.workerUrl,
+      workerUrl: opts?.workerUrl ?? '',
     };
+    this.fs = new FSProxy(this._send.bind(this));
   }
 
-  /**
-   * Initialize the runtime — loads stdlib and compiles WASM.
-   * Must be called before run().
-   */
+  // ── init ───────────────────────────────────────────────────────────────────
+
   async init(): Promise<void> {
     let workerUrl: string;
 
     if (this.opts.workerUrl) {
       workerUrl = this.opts.workerUrl;
     } else {
-      // Try to resolve worker.js relative to this module
-      // Falls back to CDN if import.meta.url is not available
       try {
         workerUrl = new URL('./worker.js', import.meta.url).href;
       } catch {
-        workerUrl = 'https://cdn.jsdelivr.net/npm/cpython-wasm@0.2.0/dist/worker.js';
+        workerUrl = `${GITHUB_RELEASE}/worker.js`;
       }
     }
 
     this.worker = new Worker(workerUrl, { type: 'module' });
 
     return new Promise((resolve, reject) => {
-      const timeout = setTimeout(() => reject(new Error('PythonRuntime init timeout')), 120_000);
+      const timeout = setTimeout(() => reject(new Error('PythonRuntime init timeout (120s)')), 120_000);
 
       this.worker!.onmessage = (e: MessageEvent) => {
         const msg = e.data as WorkerMessage;
-
         if (msg.type === 'ready') {
           clearTimeout(timeout);
           this.ready = true;
-          resolve();
-          // Switch to normal message handler
           this.worker!.onmessage = this._handleMessage.bind(this);
+          resolve();
+        } else if (msg.type === 'status') {
+          this.onStatus(msg.text);
         } else if (msg.type === 'error' && msg.id === 'init') {
           clearTimeout(timeout);
           reject(new Error(msg.error.message));
-        } else if (msg.type === 'status') {
-          // ignore status during init
         }
       };
 
@@ -95,7 +140,6 @@ export class PythonRuntime {
         reject(new Error('Worker error: ' + e.message));
       };
 
-      // Send init message
       this.worker!.postMessage({
         type: 'init',
         wasmUrl: this.opts.wasmUrl,
@@ -104,95 +148,77 @@ export class PythonRuntime {
     });
   }
 
-  /**
-   * Install a Python package from PyPI.
-   * Supports pure-Python packages and resolves dependencies automatically.
-   */
-  async pip(packageName: string): Promise<{ name: string; version: string } | null> {
-    if (!this.ready || !this.worker) {
-      return Promise.reject(new Error('PythonRuntime not initialized. Call init() first.'));
-    }
-    const id = String(++this.runCounter);
-    return new Promise((resolve, reject) => {
-      this.pendingRuns.set(id, { resolve: resolve as (r: RunResult) => void, reject });
-      this.worker!.postMessage({ type: 'pip.install', id, package: packageName });
-    }) as unknown as Promise<{ name: string; version: string } | null>;
-  }
+  // ── run ────────────────────────────────────────────────────────────────────
 
-  /**
-   * Run Python code. Returns when execution completes.
-   */
   run(code: string): Promise<RunResult> {
-    if (!this.ready || !this.worker) {
-      return Promise.reject(new Error('PythonRuntime not initialized. Call init() first.'));
-    }
-
-    const id = String(++this.runCounter);
-
-    return new Promise((resolve, reject) => {
-      this.pendingRuns.set(id, { resolve, reject });
-      this.worker!.postMessage({ type: 'run', id, code });
-    });
+    return this._send({ type: 'run', code }) as Promise<RunResult>;
   }
 
-  /**
-   * Write a file into the virtual filesystem.
-   */
-  writeFile(path: string, content: string | Uint8Array): void {
-    if (!this.worker) throw new Error('Not initialized');
-    const bytes = typeof content === 'string' ? new TextEncoder().encode(content) : content;
-    this.worker.postMessage({ type: 'fs.write', path, content: bytes });
+  // ── pip ────────────────────────────────────────────────────────────────────
+
+  pip(packageName: string): Promise<InstallResult | null> {
+    return this._send({ type: 'pip.install', package: packageName }) as Promise<InstallResult | null>;
   }
 
+  // ── C-extensions ───────────────────────────────────────────────────────────
+
   /**
-   * Destroy the runtime and free resources.
+   * Register a compiled C-extension WASM module.
+   * After registration, `import <moduleName>` will work in Python.
+   *
+   * @param moduleName - Python module name (e.g. "testmodule")
+   * @param wasmBytes  - Compiled .wasm bytes
    */
+  async loadExtension(moduleName: string, wasmBytes: Uint8Array): Promise<void> {
+    await this._send({ type: 'cext.register', moduleName, wasmBytes });
+  }
+
+  // ── destroy ────────────────────────────────────────────────────────────────
+
   destroy(): void {
     this.worker?.terminate();
     this.worker = null;
     this.ready = false;
-    for (const { reject } of this.pendingRuns.values()) {
+    for (const { reject } of this.pending.values()) {
       reject(new Error('Runtime destroyed'));
     }
-    this.pendingRuns.clear();
+    this.pending.clear();
+  }
+
+  // ── Internal ───────────────────────────────────────────────────────────────
+
+  private _send(msg: object): Promise<unknown> {
+    if (!this.ready || !this.worker) {
+      return Promise.reject(new Error('PythonRuntime not initialized. Call init() first.'));
+    }
+    const id = String(++this.counter);
+    return new Promise((resolve, reject) => {
+      this.pending.set(id, { resolve, reject });
+      this.worker!.postMessage({ ...msg, id });
+    });
   }
 
   private _handleMessage(e: MessageEvent): void {
     const msg = e.data as WorkerMessage;
-
     switch (msg.type) {
-      case 'stdout':
-        this.onStdout(msg.data);
-        break;
-      case 'stderr':
-        this.onStderr(msg.data);
-        break;
+      case 'stdout':      this.onStdout(msg.data); break;
+      case 'stderr':      this.onStderr(msg.data); break;
+      case 'status':      this.onStatus(msg.text); break;
+      case 'pip.status':  this.onStderr('[pip] ' + msg.data + '\n'); break;
       case 'result': {
-        const pending = this.pendingRuns.get(msg.id);
-        if (pending) {
-          pending.resolve({ exitCode: 0 });
-          this.pendingRuns.delete(msg.id);
-        }
+        const p = this.pending.get(msg.id);
+        if (p) { p.resolve({ exitCode: 0 }); this.pending.delete(msg.id); }
         break;
       }
-      case 'pip.result': {
-        const pending = this.pendingRuns.get(msg.id);
-        if (pending) {
-          pending.resolve(msg.value as unknown as RunResult);
-          this.pendingRuns.delete(msg.id);
-        }
-        break;
-      }
-      case 'pip.status': {
-        this.onStderr('[pip] ' + msg.data + '\n');
+      case 'pip.result':
+      case 'fs.result': {
+        const p = this.pending.get(msg.id);
+        if (p) { p.resolve(msg.value); this.pending.delete(msg.id); }
         break;
       }
       case 'error': {
-        const pending = this.pendingRuns.get(msg.id);
-        if (pending) {
-          pending.reject(new Error(msg.error.message));
-          this.pendingRuns.delete(msg.id);
-        }
+        const p = this.pending.get(msg.id);
+        if (p) { p.reject(new Error(msg.error.message)); this.pending.delete(msg.id); }
         break;
       }
     }
@@ -209,4 +235,5 @@ type WorkerMessage =
   | { type: 'result'; id: string }
   | { type: 'pip.result'; id: string; value: unknown }
   | { type: 'pip.status'; data: string }
+  | { type: 'fs.result'; id: string; value: unknown }
   | { type: 'error'; id: string; error: { message: string } };
