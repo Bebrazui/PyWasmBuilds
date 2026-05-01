@@ -201,12 +201,53 @@ function buildWasi(getMem, args, envVars, onStdout, onStderr, checkInt) {
   const str = (ptr, len) => new TextDecoder().decode(new Uint8Array(getMem().buffer, ptr, len));
 
   let stdoutBuf = '', stderrBuf = '';
+  let stdoutTimer = null, stderrTimer = null;
 
-  function flushLine(buf, cb) {
-    const lines = buf.split('\n');
-    for (let i = 0; i < lines.length - 1; i++) cb(lines[i] + '\n');
-    return lines[lines.length - 1];
+  // Smart buffering:
+  // - Flush immediately on \n (line-buffered output like print())
+  // - For partial lines (print(..., end="")), flush after a short delay
+  //   so rapid writes are batched into one postMessage instead of many
+  const FLUSH_DELAY_MS = 8; // ~1 frame at 120fps
+
+  function scheduleFlush(getBuf, setBuf, cb, getTimer, setTimer) {
+    if (getTimer()) return; // already scheduled
+    setTimer(setTimeout(() => {
+      setTimer(null);
+      const remaining = getBuf();
+      if (remaining) { cb(remaining); setBuf(''); }
+    }, FLUSH_DELAY_MS));
   }
+
+  function writeToStream(text, getBuf, setBuf, cb, getTimer, setTimer) {
+    setBuf(getBuf() + text);
+    const buf = getBuf();
+
+    // Flush all complete lines immediately
+    const lastNl = buf.lastIndexOf('\n');
+    if (lastNl !== -1) {
+      const toSend = buf.slice(0, lastNl + 1);
+      setBuf(buf.slice(lastNl + 1));
+      cb(toSend);
+      // Cancel pending timer since we just flushed
+      if (getTimer()) { clearTimeout(getTimer()); setTimer(null); }
+    }
+
+    // If there's still a partial line, schedule a delayed flush
+    if (getBuf()) {
+      scheduleFlush(getBuf, setBuf, cb, getTimer, setTimer);
+    }
+  }
+
+  // Closure helpers for stdout/stderr state
+  const getStdoutBuf = () => stdoutBuf;
+  const setStdoutBuf = (v) => { stdoutBuf = v; };
+  const getStdoutTimer = () => stdoutTimer;
+  const setStdoutTimer = (v) => { stdoutTimer = v; };
+
+  const getStderrBuf = () => stderrBuf;
+  const setStderrBuf = (v) => { stderrBuf = v; };
+  const getStderrTimer = () => stderrTimer;
+  const setStderrTimer = (v) => { stderrTimer = v; };
 
   const impl = {
     args_sizes_get(argcPtr, bufSizePtr) {
@@ -248,8 +289,8 @@ function buildWasi(getMem, args, envVars, onStdout, onStderr, checkInt) {
         if (!len) continue;
         const chunk = new Uint8Array(getMem().buffer, base, len).slice();
         const text = new TextDecoder().decode(chunk);
-        if (fd === 1) { stdoutBuf += text; stdoutBuf = flushLine(stdoutBuf, onStdout); }
-        else if (fd === 2) { stderrBuf += text; stderrBuf = flushLine(stderrBuf, onStderr); }
+        if (fd === 1) { writeToStream(text, getStdoutBuf, setStdoutBuf, onStdout, getStdoutTimer, setStdoutTimer); }
+        else if (fd === 2) { writeToStream(text, getStderrBuf, setStderrBuf, onStderr, getStderrTimer, setStderrTimer); }
         else if (fd === 100) {
           // ── C-extension callback channel ──────────────────────────────────
           // Handles two commands:
@@ -577,6 +618,9 @@ function buildWasi(getMem, args, envVars, onStdout, onStderr, checkInt) {
   return {
     wasi: proxy,
     flush() {
+      // Cancel pending timers and flush remaining buffers immediately
+      if (stdoutTimer) { clearTimeout(stdoutTimer); stdoutTimer = null; }
+      if (stderrTimer) { clearTimeout(stderrTimer); stderrTimer = null; }
       if (stdoutBuf) { onStdout(stdoutBuf); stdoutBuf = ''; }
       if (stderrBuf) { onStderr(stderrBuf); stderrBuf = ''; }
     }
